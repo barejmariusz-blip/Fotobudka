@@ -108,7 +108,13 @@ class SettingsDialog(QDialog):
                 self.repo.setText(gh.repo)
                 v = self.values()
             gh.ensure_initialized(branch)
-            gh.ensure_pages(branch)
+            try:
+                gh.ensure_pages(branch)
+            except gallery.GitHubError:
+                QMessageBox.warning(self, APP, "Połączenie działa ✔, ale GitHub Pages trzeba włączyć raz ręcznie:\n"
+                                    f"repo {v['repo']} → Settings → Pages → Source: „Deploy from a branch” → "
+                                    f"Branch: {branch}, folder: / (root) → Save.\n\nAdres galerii: {gallery.site_url(v)}")
+                return
             QMessageBox.information(self, APP, f"Działa ✔\nGalerie będą pod adresem:\n{gallery.site_url(v)}")
         except Exception as e:  # noqa: BLE001
             QMessageBox.warning(self, APP, f"Nie działa:\n{e}")

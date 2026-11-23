@@ -2244,8 +2244,11 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, APP_NAME, f"Nie udało się opublikować galerii:\n{err}")
                 return
             g["folder"] = folder
+            warn = g.pop("warn", "")
             reg["galleries"].append(g)
             gallery.save_registry(reg)
+            if warn:
+                QMessageBox.warning(self, APP_NAME, warn)
             gallery_ui.LinkDialog(self, gallery.gallery_link(s, g), g["title"], True).exec()
         gallery_ui.run_job(self, "Przygotowanie galerii…",
                            lambda prog, canc: gallery.publish(s, items, info, s.get("watermark", ""), prog, canc), done)

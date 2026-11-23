@@ -341,10 +341,16 @@ def publish(settings: dict, items, info: dict, wm: str, progress=None, cancelled
     files["index.html"] = viewer_html()
     files["robots.txt"] = b"User-agent: *\nDisallow: /\n"
     gh.commit_files(branch, files, [], f"Galeria {gid}", progress, cancelled)
-    gh.ensure_pages(branch)
+    warn = ""
+    try:
+        gh.ensure_pages(branch)
+    except GitHubError:
+        warn = ("GitHub Pages nie jest włączone, a token nie ma uprawnienia, żeby włączyć je sam.\n"
+                f"Włącz raz ręcznie: repo {settings['repo']} → Settings → Pages → Source: „Deploy from a branch” → "
+                f"Branch: {branch}, folder: / (root) → Save.\nGaleria jest już wysłana – link zadziała 1–2 minuty po włączeniu.")
     return {"id": gid, "key": key, "title": info.get("title", ""), "count": len(items),
             "created": int(time.time()), "max": info.get("max", 0),
-            "names": [n for _, _, n in items]}
+            "names": [n for _, _, n in items], "warn": warn}
 
 
 def delete(settings: dict, gid: str):
