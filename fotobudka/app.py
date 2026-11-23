@@ -39,6 +39,8 @@ FILTERS = [
     ("Sugerowane do odrzutu", lambda p: p.suggested and not p.rejected),
     ("Najlepsze z serii", lambda p: p.best),
     ("Z etykietą", lambda p: p.label is not None),
+    ("Prześwietlone ☀", lambda p: p.expo == "over"),
+    ("Niedoświetlone ☾", lambda p: p.expo == "under"),
 ]
 
 
@@ -63,6 +65,9 @@ class Photo:
     rel: float | None = None
     best: bool = False
     failed: bool = False
+    ev: tuple | None = None              # (wypalone, jasność top 0.5%, średnia)
+    hash: str | None = None              # dHash do podobnych kadrów
+    expo: str | None = None              # over / under
 
 
 # =========================================================================== miniatury
@@ -166,6 +171,10 @@ class ThumbDelegate(QStyledItemDelegate):
             badges.append(("TOP", "#c99a10"))
         if p.suggested and not p.rejected:
             badges.append(("?", "#d9822b"))
+        if p.expo == "over":
+            badges.append(("☀", "#e8e8e8"))
+        elif p.expo == "under":
+            badges.append(("☾", "#7b8fc7"))
         x = bottom.right()
         for text, color in badges:
             w = 30 if len(text) > 1 else 18
@@ -355,6 +364,153 @@ class ExportDialog(QDialog):
         return ok
 
 
+def fmt_exposure(t: float) -> str:
+    if t >= 0.3:
+        return f"{t:g} s"
+    return f"1/{round(1 / t)} s"
+
+
+class ExifFilterDialog(QDialog):
+    """Filtr po danych z aparatu - działa na żywo, okno może zostać otwarte."""
+
+    def __init__(self, win: "MainWindow"):
+        super().__init__(win)
+        self.win = win
+        self.setWindowTitle("Filtr EXIF")
+        self.setModal(False)
+        lay = QFormLayout(self)
+        ph = [p for p in win.photos if p.meta]
+
+        def rng(vals, lo, hi):
+            vals = [v for v in vals if v]
+            return (min(vals), max(vals)) if vals else (lo, hi)
+
+        def row(label, *widgets):
+            box = QWidget()
+            h = QHBoxLayout(box)
+            h.setContentsMargins(0, 0, 0, 0)
+            cb = QCheckBox()
+            h.addWidget(cb)
+            for w in widgets:
+                h.addWidget(w)
+            h.addStretch(1)
+            lay.addRow(label, box)
+            for w in widgets:
+                sig = getattr(w, "valueChanged", None) or getattr(w, "currentIndexChanged", None)
+                if sig is not None:
+                    sig.connect(lambda *_, cb=cb: (cb.setChecked(True), self.apply()))
+            cb.toggled.connect(lambda _: self.apply())
+            return cb
+
+        def spin(lo, hi, val, dec=0, step=1, suffix=""):
+            w = QDoubleSpinBox() if dec else QSpinBox()
+            if dec:
+                w.setDecimals(dec)
+            w.setRange(lo, hi)
+            w.setSingleStep(step)
+            w.setValue(val)
+            w.setSuffix(suffix)
+            return w
+
+        a, b = rng([p.meta.iso for p in ph], 100, 102400)
+        self.iso_lo, self.iso_hi = spin(50, 409600, a, step=100), spin(50, 409600, b, step=100)
+        self.iso_cb = row("ISO od / do:", self.iso_lo, QLabel("–"), self.iso_hi)
+
+        self.exp_mode = QComboBox()
+        self.exp_mode.addItem("dłuższy niż (ryzyko poruszenia)", "longer")
+        self.exp_mode.addItem("krótszy niż", "shorter")
+        self.exp_val = spin(1, 8000, 250)
+        self.exp_val.setPrefix("1/")
+        self.exp_val.setSuffix(" s")
+        self.exp_cb = row("Czas naświetlania:", self.exp_mode, self.exp_val)
+
+        a, b = rng([p.meta.fnumber for p in ph], 1.0, 22.0)
+        self.f_lo, self.f_hi = spin(0.7, 64, a, 1, 0.1), spin(0.7, 64, b, 1, 0.1)
+        self.f_lo.setPrefix("f/")
+        self.f_hi.setPrefix("f/")
+        self.f_cb = row("Przysłona od / do:", self.f_lo, QLabel("–"), self.f_hi)
+
+        a, b = rng([p.meta.focal for p in ph], 10, 600)
+        self.fl_lo, self.fl_hi = spin(1, 2000, int(a), suffix=" mm"), spin(1, 2000, int(round(b)), suffix=" mm")
+        self.fl_cb = row("Ogniskowa od / do:", self.fl_lo, QLabel("–"), self.fl_hi)
+
+        self.lens = QComboBox()
+        for v in sorted({p.meta.lens for p in ph if p.meta.lens}):
+            self.lens.addItem(v, v)
+        self.lens_cb = row("Obiektyw:", self.lens)
+
+        self.cam = QComboBox()
+        for v in sorted({p.meta.model for p in ph if p.meta.model}):
+            self.cam.addItem(v, v)
+        self.cam_cb = row("Aparat:", self.cam)
+
+        self.count_lbl = QLabel()
+        lay.addRow(self.count_lbl)
+        bb = QDialogButtonBox()
+        clear = bb.addButton("Wyczyść filtr", QDialogButtonBox.ButtonRole.ResetRole)
+        close = bb.addButton("Zamknij", QDialogButtonBox.ButtonRole.RejectRole)
+        clear.clicked.connect(self.clear)
+        close.clicked.connect(self.close)
+        lay.addRow(bb)
+        self.apply()
+
+    def clear(self):
+        for cb in (self.iso_cb, self.exp_cb, self.f_cb, self.fl_cb, self.lens_cb, self.cam_cb):
+            cb.blockSignals(True)
+            cb.setChecked(False)
+            cb.blockSignals(False)
+        self.apply()
+
+    def predicate(self):
+        conds = []
+        if self.iso_cb.isChecked():
+            lo, hi = self.iso_lo.value(), self.iso_hi.value()
+            conds.append(lambda m: m.iso is not None and lo <= m.iso <= hi)
+        if self.exp_cb.isChecked():
+            t = 1 / self.exp_val.value()
+            if self.exp_mode.currentData() == "longer":
+                conds.append(lambda m: m.exposure is not None and m.exposure > t * 1.001)
+            else:
+                conds.append(lambda m: m.exposure is not None and m.exposure < t * 0.999)
+        if self.f_cb.isChecked():
+            lo, hi = self.f_lo.value(), self.f_hi.value()
+            conds.append(lambda m: m.fnumber is not None and lo - 0.05 <= m.fnumber <= hi + 0.05)
+        if self.fl_cb.isChecked():
+            lo, hi = self.fl_lo.value(), self.fl_hi.value()
+            conds.append(lambda m: m.focal is not None and lo - 0.5 <= m.focal <= hi + 0.5)
+        if self.lens_cb.isChecked() and self.lens.count():
+            v = self.lens.currentData()
+            conds.append(lambda m: m.lens == v)
+        if self.cam_cb.isChecked() and self.cam.count():
+            v = self.cam.currentData()
+            conds.append(lambda m: m.model == v)
+        if not conds:
+            return None
+        return lambda p: p.meta is not None and all(c(p.meta) for c in conds)
+
+    def apply(self):
+        pred = self.predicate()
+        self.win.set_exif_filter(pred, self._describe())
+        n = sum(1 for p in self.win.photos if pred is None or pred(p))
+        self.count_lbl.setText(f"<b>{n}</b> z {len(self.win.photos)} zdjęć spełnia warunki EXIF")
+
+    def _describe(self) -> str:
+        d = []
+        if self.iso_cb.isChecked():
+            d.append(f"ISO {self.iso_lo.value()}–{self.iso_hi.value()}")
+        if self.exp_cb.isChecked():
+            d.append(("czas > " if self.exp_mode.currentData() == "longer" else "czas < ") + f"1/{self.exp_val.value()}")
+        if self.f_cb.isChecked():
+            d.append(f"f/{self.f_lo.value():g}–{self.f_hi.value():g}")
+        if self.fl_cb.isChecked():
+            d.append(f"{self.fl_lo.value()}–{self.fl_hi.value()} mm")
+        if self.lens_cb.isChecked():
+            d.append(self.lens.currentText())
+        if self.cam_cb.isChecked():
+            d.append(self.cam.currentText())
+        return ", ".join(d)
+
+
 HELP = """<b>Skróty</b><br>
 ← → / kółko – poprzednie / następne<br>
 1–5 – ocena, 0 – usuń ocenę<br>
@@ -380,6 +536,9 @@ class MainWindow(QMainWindow):
         self.groups: list[analysis.Group] = []
         self.state: dict = {"photos": {}}
         self.gen = 0
+        self.vgen = 0                        # zmienia się przy zmianie kolejności zdjęć
+        self._gl_cache: dict = {}
+        self.exif_filter = None              # funkcja Photo -> bool albo None
         self.cur: int | None = None          # indeks w self.photos
         self.dirty_xmp: set[int] = set()
         self.undo: list[list[tuple[int, int, bool, str | None]]] = []
@@ -450,6 +609,13 @@ class MainWindow(QMainWindow):
         self.rej_btn.setStyleSheet("QPushButton{padding:3px 10px;} QPushButton:checked{background:#8a2a2a; color:white;}")
         self.rej_btn.clicked.connect(lambda _: self.toggle_rejected_view())
         tb.addWidget(self.rej_btn)
+        self.exif_btn = QPushButton("🔍 Filtr EXIF")
+        self.exif_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.exif_btn.setToolTip("Filtruj po ISO, czasie naświetlania, przysłonie, ogniskowej, obiektywie")
+        self.exif_btn.setStyleSheet("QPushButton{padding:3px 10px;} QPushButton[active=\"true\"]{background:#2d5d8a; color:white;}")
+        self.exif_btn.clicked.connect(self.open_exif_filter)
+        tb.addWidget(self.exif_btn)
+        self.exif_dlg = None
         tb.addSeparator()
 
         tb.addWidget(QLabel(" Czułość: "))
@@ -465,7 +631,24 @@ class MainWindow(QMainWindow):
         self.sens_lbl.setMinimumWidth(38)
         tb.addWidget(self.sens_lbl)
 
-        tb.addWidget(QLabel("  Seria co: "))
+        tb.addWidget(QLabel("  Seria wg: "))
+        self.mode_box = QComboBox()
+        self.mode_box.addItem("czasu (seria zdjęć)", "time")
+        self.mode_box.addItem("podobieństwa kadru", "sim")
+        self.mode_box.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.mode_box.setToolTip("Czas: zdjęcia zrobione jedno po drugim to seria.\n"
+                                 "Podobieństwo: łączy prawie identyczne kadry, nawet zrobione w odstępie minut.")
+        self.mode_box.currentIndexChanged.connect(lambda _: self._settings_changed())
+        tb.addWidget(self.mode_box)
+        self.sim = QSpinBox()
+        self.sim.setRange(60, 99)
+        self.sim.setValue(85)
+        self.sim.setPrefix("≥ ")
+        self.sim.setSuffix(" %")
+        self.sim.setToolTip("Jak bardzo kadry muszą być podobne, żeby trafić do jednej grupy")
+        self.sim.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        self.sim.valueChanged.connect(lambda _: self._settings_changed())
+        self.sim_act = tb.addWidget(self.sim)
         self.gap = QDoubleSpinBox()
         self.gap.setRange(0.2, 30.0)
         self.gap.setSingleStep(0.5)
@@ -474,7 +657,7 @@ class MainWindow(QMainWindow):
         self.gap.setToolTip("Zdjęcia zrobione w odstępie mniejszym niż ten czas = jedna seria")
         self.gap.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         self.gap.valueChanged.connect(lambda _: self._settings_changed())
-        tb.addWidget(self.gap)
+        self.gap_act = tb.addWidget(self.gap)
         self.recalc_btn = QPushButton("🔄 Przelicz")
         self.recalc_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.recalc_btn.setEnabled(False)
@@ -620,7 +803,15 @@ class MainWindow(QMainWindow):
         self.gap.blockSignals(True)
         self.gap.setValue(float(s.value("gap", 1.5)))
         self.gap.blockSignals(False)
+        for w_ in (self.mode_box, self.sim):
+            w_.blockSignals(True)
+        self.mode_box.setCurrentIndex(1 if s.value("mode", "time") == "sim" else 0)
+        self.sim.setValue(int(s.value("sim", 85)))
+        for w_ in (self.mode_box, self.sim):
+            w_.blockSignals(False)
         self.applied_sens, self.applied_gap = self.sens.value(), self.gap.value()
+        self.applied_mode, self.applied_sim = self.mode_box.currentData(), self.sim.value()
+        self._mode_widgets()
         self.sens_lbl.setText(f" {self.applied_sens}%")
         self.auto_adv.setChecked(s.value("auto_adv", "true") in (True, "true"))
         self.auto_xmp.setChecked(s.value("auto_xmp", "true") in (True, "true"))
@@ -633,6 +824,8 @@ class MainWindow(QMainWindow):
         s.setValue("geometry", self.saveGeometry())
         s.setValue("sens", self.sens.value())
         s.setValue("gap", self.gap.value())
+        s.setValue("mode", self.mode_box.currentData())
+        s.setValue("sim", self.sim.value())
         s.setValue("auto_adv", self.auto_adv.isChecked())
         s.setValue("auto_xmp", self.auto_xmp.isChecked())
         self.pool.clear()
@@ -652,6 +845,8 @@ class MainWindow(QMainWindow):
             if self.auto_xmp.isChecked():
                 self._flush_xmp()
         self.gen += 1
+        self.vgen += 1
+        self._gl_cache = {}
         self.pool.clear()
         self.view_pool.clear()
         self.folder = folder
@@ -670,6 +865,11 @@ class MainWindow(QMainWindow):
         self.model.set_rows([])
         self.banner.setVisible(False)
         self.analysis_running = False
+        if self.exif_dlg is not None:
+            self.exif_dlg.close()
+            self.exif_dlg.deleteLater()
+            self.exif_dlg = None
+        self.set_exif_filter(None, "")
         self._update_apply()
 
         names = sorted(n for n in os.listdir(folder)
@@ -701,9 +901,13 @@ class MainWindow(QMainWindow):
             p.rejected = bool(s.get("x", False))
             p.rej_by = s.get("xb") if p.rejected else None
             p.label = s.get("l")
-            if s.get("sz") == st.st_size and abs(s.get("mt", 0) - st.st_mtime) < 2 and "t" in s:
+            if s.get("sz") == st.st_size and abs(s.get("mt", 0) - st.st_mtime) < 2 and "t" in s and "ex" in s:
                 p.meta = raw.PhotoMeta(s["t"], s.get("o", 1), s.get("po", 0), s.get("pl", 0))
-                p.score = s.get("s") if s.get("sv") == analysis.METRIC_VERSION else None
+                p.meta.set_exif(s["ex"])
+                if s.get("sv") == analysis.METRIC_VERSION:
+                    p.score, p.hash = s.get("s"), s.get("h")
+                    p.ev = tuple(s["ev"]) if s.get("ev") else None
+                    p.expo = analysis.exposure_flag(p.ev)
             self.photos.append(p)
             if p.meta is None:
                 need_meta.append(len(self.photos) - 1)
@@ -764,10 +968,13 @@ class MainWindow(QMainWindow):
     def _stage2_name(self):
         return "Wczytywanie miniatur" if self.analysis_cached else "Etap 2/2 – analiza ostrości"
 
-    def _on_analyzed(self, gen, idx, score, thumb):
+    def _on_analyzed(self, gen, idx, score, thumb, extras):
         if gen != self.gen:
             return
         p = self.photos[idx]
+        if extras:
+            p.ev, p.hash = extras["ev"], extras["h"]
+            p.expo = analysis.exposure_flag(p.ev)
         if thumb is None:
             p.failed = True
         else:
@@ -786,7 +993,9 @@ class MainWindow(QMainWindow):
     def _analysis_finished(self):
         self.analysis_running = False
         self.progress.setVisible(False)
+        self._regroup(recompute=False)
         self._recompute()
+        self.apply_filter()
         self._save_state_cache()
         n = len(self.photos)
         series = sum(1 for g in self.groups if len(g.members) > 1)
@@ -796,10 +1005,15 @@ class MainWindow(QMainWindow):
         secs = int(time.time() - self.analysis_t0)
         head = ("✔ <b>Analiza wczytana z poprzedniego razu</b>" if self.analysis_cached
                 else f"✔ <b>Analiza zakończona</b> w {secs // 60}:{secs % 60:02d}")
-        txt = (f"{head} — {n} zdjęć, {series} serii, {self.best_count()} najlepszych klatek (TOP).<br>"
+        gw = "grup podobnych kadrów" if self.applied_mode == "sim" else "serii"
+        txt = (f"{head} — {n} zdjęć, {series} {gw}, {self.best_count()} najlepszych klatek (TOP).<br>"
                f"Do odrzutu: <b>{blur + weak}</b> ({blur} nieostrych, {weak} wyraźnie słabszych w serii).")
         if failed:
             txt += f"<br><span style='color:#e07070'>Nie udało się odczytać {failed} plików.</span>"
+        over = sum(1 for p in self.photos if p.expo == "over")
+        under = sum(1 for p in self.photos if p.expo == "under")
+        if over or under:
+            txt += f"<br>Ekspozycja: ☀ {over} prześwietlonych, ☾ {under} niedoświetlonych (filtr pokaże je osobno)."
         if blur + weak == 0:
             txt += "<br>Nic nie wymaga odrzucenia – możesz od razu oceniać."
         self.banner_lbl.setText(txt)
@@ -813,42 +1027,60 @@ class MainWindow(QMainWindow):
         return sum(1 for p in self.photos if p.best)
 
     # ------------------------------------------------------------------ serie / sugestie
-    def _count_pending(self, sens: int, gap: float) -> int:
+    def _count_pending(self, sens: int, gap: float, mode: str = "time", sim: int = 85) -> int:
         """Ile zdjęć byłoby do odrzutu przy podanych ustawieniach (bez zmiany stanu)."""
         if not self.photos or any(p.meta is None for p in self.photos):
             return 0
-        groups = analysis.build_groups([p.meta.capture_time or 0 for p in self.photos], gap)
+        groups = [analysis.Group(i, m) for i, m in enumerate(self._group_lists(mode, gap, sim))]
         rej, _, _ = analysis.suggest([p.score for p in self.photos], groups, sens / 100)
         return sum(1 for i in rej if not self.photos[i].rejected and self.photos[i].rating == 0)
 
     def _settings_changed(self):
         self.sens_lbl.setText(f" {self.sens.value()}%")
-        pending = (self.sens.value() != self.applied_sens or abs(self.gap.value() - self.applied_gap) > 1e-9)
+        self._mode_widgets()
+        mode = self.mode_box.currentData()
+        pending = (self.sens.value() != self.applied_sens or abs(self.gap.value() - self.applied_gap) > 1e-9
+                   or mode != self.applied_mode or (mode == "sim" and self.sim.value() != self.applied_sim))
         ready = bool(self.photos) and not self.analysis_running
         self.recalc_btn.setEnabled(pending and ready)
         if pending and ready:
-            now = self._count_pending(self.applied_sens, self.applied_gap)
-            new = self._count_pending(self.sens.value(), self.gap.value())
+            now = self._count_pending(self.applied_sens, self.applied_gap, self.applied_mode, self.applied_sim)
+            new = self._count_pending(self.sens.value(), self.gap.value(), mode, self.sim.value())
             diff = new - now
-            self.preview_lbl.setText(f"po przeliczeniu: {new} do odrzutu ({'+' if diff >= 0 else ''}{diff})")
+            ng = sum(1 for g in self._group_lists(mode, self.gap.value(), self.sim.value()) if len(g) > 1)
+            self.preview_lbl.setText(f"po przeliczeniu: {ng} grup, {new} do odrzutu ({'+' if diff >= 0 else ''}{diff})")
         elif pending and self.analysis_running:
             self.preview_lbl.setText("zostanie użyte po zakończeniu analizy")
         else:
             self.preview_lbl.setText("")
 
+    def _mode_widgets(self):
+        sim = self.mode_box.currentData() == "sim"
+        self.sim_act.setVisible(sim)
+        self.gap_act.setVisible(not sim)
+
     def recalc(self):
         old_sens, old_gap = self.applied_sens, self.applied_gap
+        old_mode, old_sim = self.applied_mode, self.applied_sim
         before = sum(1 for p in self.photos if p.suggested and not p.rejected and p.rating == 0)
         self._regroup(recompute=False)
         self._recompute()
+        self.apply_filter()
+        if self.cur is not None:
+            self.show_photo(self.cur)
         self._settings_changed()
         after = sum(1 for p in self.photos if p.suggested and not p.rejected and p.rating == 0)
         series = sum(1 for g in self.groups if len(g.members) > 1)
         changes = []
         if self.applied_sens != old_sens:
             changes.append(f"czułość {old_sens}% → {self.applied_sens}%")
-        if abs(self.applied_gap - old_gap) > 1e-9:
-            changes.append(f"seria co {old_gap:g} s → {self.applied_gap:g} s ({series} serii)")
+        if self.applied_mode != old_mode:
+            changes.append("serie wg podobieństwa kadru" if self.applied_mode == "sim" else "serie wg czasu")
+        elif self.applied_mode == "sim" and self.applied_sim != old_sim:
+            changes.append(f"podobieństwo {old_sim}% → {self.applied_sim}%")
+        if self.applied_mode == "time" and abs(self.applied_gap - old_gap) > 1e-9:
+            changes.append(f"seria co {old_gap:g} s → {self.applied_gap:g} s")
+        changes.append(f"{series} {'grup' if self.applied_mode == 'sim' else 'serii'}")
         txt = (f"🔄 <b>Przeliczono</b> ({', '.join(changes)}). "
                f"Sugerowane do odrzutu: <b>{after}</b> (było {before}).")
         if any(p.rejected and p.rej_by in ("blur", "series") for p in self.photos):
@@ -859,16 +1091,66 @@ class MainWindow(QMainWindow):
         self.banner.setStyleSheet("background:#3d2f1f; color:#e6e6e6;")
         self.banner.setVisible(True)
 
+    def _group_lists(self, mode: str, gap: float, sim: int) -> list[list[int]]:
+        """Listy indeksów (w bieżącej kolejności self.photos) dla danego trybu grupowania."""
+        key = (mode, round(gap, 3), sim, len(self.photos), sum(1 for p in self.photos if p.hash))
+        if key in self._gl_cache:
+            return self._gl_cache[key]
+        res = self._group_lists_calc(mode, gap, sim)
+        self._gl_cache[key] = res
+        return res
+
+    def _group_lists_calc(self, mode: str, gap: float, sim: int) -> list[list[int]]:
+        tord = sorted(range(len(self.photos)),
+                      key=lambda i: (self.photos[i].meta.capture_time or 0, self.photos[i].name))
+        hashes = [self.photos[i].hash for i in tord]
+        if mode == "sim" and all(h or self.photos[i].failed for h, i in zip(hashes, tord)):
+            gl = analysis.similarity_groups(hashes, sim / 100)
+        else:
+            gl = [g.members for g in analysis.build_groups([self.photos[i].meta.capture_time or 0 for i in tord], gap)]
+        return [[tord[j] for j in g] for g in gl]
+
+    def _apply_order(self, order: list[int]):
+        if order == list(range(len(order))):
+            return
+        inv = {old: new for new, old in enumerate(order)}
+        self._gl_cache = {}
+        self.photos = [self.photos[i] for i in order]
+        if self.cur is not None:
+            self.cur = inv.get(self.cur)
+        self.view_cache = OrderedDict((inv[k], v) for k, v in self.view_cache.items() if k in inv)
+        if self.full_cache:
+            self.full_cache = (inv[self.full_cache[0]], self.full_cache[1])
+        self.pending_view.clear()
+        self.vgen += 1
+        self.dirty_xmp = {inv[i] for i in self.dirty_xmp if i in inv}
+        self.undo = [[(inv[t[0]],) + tuple(t[1:]) for t in snap if t[0] in inv] for snap in self.undo]
+
     def _regroup(self, recompute=True):
         if not self.photos or any(p.meta is None for p in self.photos):
             return
-        times = [p.meta.capture_time or 0 for p in self.photos]
         self.applied_gap = self.gap.value()
-        self.groups = analysis.build_groups(times, self.applied_gap)
-        for g in self.groups:
-            for pos, i in enumerate(g.members):
+        self.applied_mode = self.mode_box.currentData()
+        self.applied_sim = self.sim.value()
+        can_reorder = not self.analysis_running
+        gl = self._group_lists(self.applied_mode, self.applied_gap, self.applied_sim) if can_reorder else \
+            [g.members for g in analysis.build_groups([p.meta.capture_time or 0 for p in self.photos], self.applied_gap)]
+        if can_reorder:
+            self._apply_order([i for g in gl for i in g])
+            sizes = [len(g) for g in gl]
+            gl, k = [], 0
+            for n in sizes:
+                gl.append(list(range(k, k + n)))
+                k += n
+        self.groups = []
+        for gi, members in enumerate(gl):
+            g = analysis.Group(gi, members)
+            self.groups.append(g)
+            for pos, i in enumerate(members):
                 p = self.photos[i]
-                p.group, p.group_pos, p.group_len = g.index, pos, len(g.members)
+                p.group, p.group_pos, p.group_len = gi, pos, len(members)
+        if can_reorder and self.model.rows:
+            self.apply_filter()
         if recompute:
             self._recompute()
 
@@ -907,6 +1189,23 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ filtr / nawigacja
     REJ_FILTER = 7
 
+    def open_exif_filter(self):
+        if not self.photos:
+            return
+        if self.exif_dlg is None:
+            self.exif_dlg = ExifFilterDialog(self)
+        self.exif_dlg.show()
+        self.exif_dlg.raise_()
+
+    def set_exif_filter(self, pred, desc: str):
+        self.exif_filter = pred
+        active = pred is not None
+        self.exif_btn.setText(f"🔍 EXIF: {desc}" if active else "🔍 Filtr EXIF")
+        self.exif_btn.setProperty("active", "true" if active else "false")
+        self.exif_btn.style().unpolish(self.exif_btn)
+        self.exif_btn.style().polish(self.exif_btn)
+        self.apply_filter()
+
     def reviewing_rejected(self) -> bool:
         return self.filter_box.currentIndex() == self.REJ_FILTER
 
@@ -926,7 +1225,8 @@ class MainWindow(QMainWindow):
 
     def apply_filter(self):
         pred = FILTERS[self.filter_box.currentIndex()][1]
-        rows = [i for i, p in enumerate(self.photos) if pred(p) or i == self.cur]
+        ex = self.exif_filter or (lambda p: True)
+        rows = [i for i, p in enumerate(self.photos) if (pred(p) and ex(p)) or i == self.cur]
         self.model.set_rows(rows)
         self._select_current()
         self.viewer.update()
@@ -1028,7 +1328,7 @@ class MainWindow(QMainWindow):
         if key in self.pending_view or p.failed or p.meta is None:
             return
         self.pending_view.add(key)
-        self.view_pool.start(ViewTask(self.sig, self.gen, idx, p.path, p.meta, None if full else self._view_edge()),
+        self.view_pool.start(ViewTask(self.sig, self.vgen, idx, p.path, p.meta, None if full else self._view_edge()),
                              2 if idx == self.cur else 0)
 
     def request_full(self):
@@ -1041,7 +1341,7 @@ class MainWindow(QMainWindow):
         return None
 
     def _on_view(self, gen, idx, full, img):
-        if gen != self.gen:
+        if gen != self.vgen:
             return
         self.pending_view.discard((idx, full))
         if img is None:
@@ -1156,10 +1456,15 @@ class MainWindow(QMainWindow):
         for p in self.photos:
             d = {"sz": p.size, "mt": p.mtime}
             if p.meta and not p.failed:
-                d.update(t=p.meta.capture_time, o=p.meta.orientation, po=p.meta.preview_offset, pl=p.meta.preview_length)
+                d.update(t=p.meta.capture_time, o=p.meta.orientation, po=p.meta.preview_offset, pl=p.meta.preview_length,
+                         ex=p.meta.exif_dict())
             if p.score is not None:
                 d["s"] = round(p.score, 4)
                 d["sv"] = analysis.METRIC_VERSION
+                if p.ev:
+                    d["ev"] = [round(v, 4) for v in p.ev]
+                if p.hash:
+                    d["h"] = p.hash
             if p.rating:
                 d["r"] = p.rating
             if p.rejected:
@@ -1308,10 +1613,35 @@ class MainWindow(QMainWindow):
             if p.meta and p.meta.capture_time else "—"
         rows = [f"<div style='font-size:15px'><b>{p.name}</b></div>",
                 f"<div style='color:#999'>{t}</div><br>"]
+        m = p.meta
+        if m:
+            parts = []
+            if m.iso:
+                parts.append(f"ISO {m.iso}")
+            if m.exposure:
+                parts.append(fmt_exposure(m.exposure))
+            if m.fnumber:
+                parts.append(f"f/{m.fnumber:g}")
+            if m.focal:
+                parts.append(f"{m.focal:g} mm")
+            if parts:
+                rows.append(f"<div style='color:#cfcfcf'>{' • '.join(parts)}</div>")
+            if m.lens or m.model:
+                rows.append(f"<div style='color:#888;font-size:11px'>{' • '.join(x for x in (m.model, m.lens) if x)}</div>")
+            rows.append("<br>")
+        word = "Grupa podobnych" if self.applied_mode == "sim" else "Seria"
         if p.group_len > 1:
-            rows.append(f"Seria #{p.group + 1}: zdjęcie <b>{p.group_pos + 1}</b> z {p.group_len}<br>")
+            rows.append(f"{word} #{p.group + 1}: zdjęcie <b>{p.group_pos + 1}</b> z {p.group_len}<br>")
         else:
             rows.append("Pojedyncze zdjęcie<br>")
+        if p.ev:
+            hi, top, mean = p.ev
+            if p.expo == "over":
+                rows.append(f"<br><b style='color:#f0f0f0'>☀ Prześwietlone</b> – wypalone {hi * 100:.0f}% kadru<br>")
+            elif p.expo == "under":
+                rows.append("<br><b style='color:#8fa3dd'>☾ Niedoświetlone</b> – brak jasnych partii<br>")
+            else:
+                rows.append(f"<span style='color:#888;font-size:11px'>Ekspozycja OK (wypalone {hi * 100:.1f}% kadru)</span><br>")
         if p.rel is not None:
             pct = int(round(p.rel * 100))
             t_abs = 0.50 - 0.25 * self.applied_sens / 100

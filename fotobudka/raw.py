@@ -26,6 +26,39 @@ class PhotoMeta:
     orientation: int = 1                 # EXIF 1..8
     preview_offset: int = 0              # offset JPEG w pliku
     preview_length: int = 0              # długość JPEG (0 = cały plik)
+    iso: int | None = None
+    exposure: float | None = None        # czas naświetlania [s]
+    fnumber: float | None = None
+    focal: float | None = None           # ogniskowa [mm]
+    lens: str | None = None
+    model: str | None = None
+
+    def exif_dict(self) -> dict:
+        return {"iso": self.iso, "exp": self.exposure, "f": self.fnumber, "fl": self.focal,
+                "lens": self.lens, "cam": self.model}
+
+    def set_exif(self, d: dict):
+        self.iso, self.exposure, self.fnumber = d.get("iso"), d.get("exp"), d.get("f")
+        self.focal, self.lens, self.model = d.get("fl"), d.get("lens"), d.get("cam")
+
+
+def _fill_exif(meta: PhotoMeta, ifd0: dict, exif: dict):
+    def num(v):
+        if isinstance(v, (list, tuple)):
+            v = v[0] if v else None
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+    iso = num(exif.get(0x8827)) or num(exif.get(0x8833))
+    meta.iso = int(iso) if iso else None
+    meta.exposure = num(exif.get(0x829A)) or None
+    meta.fnumber = num(exif.get(0x829D)) or None
+    meta.focal = num(exif.get(0x920A)) or None
+    lens = exif.get(0xA434)
+    meta.lens = lens.strip() if isinstance(lens, str) and lens.strip() else None
+    model = ifd0.get(0x0110)
+    meta.model = model.strip() if isinstance(model, str) and model.strip() else None
 
 
 # --------------------------------------------------------------------------- TIFF
@@ -59,6 +92,9 @@ def _read_ifd(buf, base: int, off: int, e: str) -> tuple[dict, int]:
             tags[tag] = list(struct.unpack_from(e + "%dI" % cnt, buf, vp))
         elif typ == 7:
             tags[tag] = bytes(buf[vp:vp + cnt])
+        elif typ in (5, 10) and cnt <= 16:
+            raw_ = struct.unpack_from(e + ("%dI" if typ == 5 else "%di") % (2 * cnt), buf, vp)
+            tags[tag] = [raw_[k] / raw_[k + 1] if raw_[k + 1] else 0.0 for k in range(0, 2 * cnt, 2)]
         else:
             tags[tag] = None
     nxt_p = p + n * 12
@@ -128,9 +164,11 @@ def _scan_tiff_previews(buf) -> tuple[PhotoMeta, list[tuple[int, int]]]:
             first = False
             meta.orientation = _first(tags.get(0x0112), 1) or 1
             exif_off = _first(tags.get(0x8769))
+            ex = {}
             if exif_off:
                 ex, _ = _read_ifd(buf, 0, exif_off, e)
                 meta.capture_time = _parse_dt(ex.get(0x9003), ex.get(0x9291))
+            _fill_exif(meta, tags, ex)
             if meta.capture_time is None:
                 meta.capture_time = _parse_dt(tags.get(0x0132))
         jo, jl = _first(tags.get(0x201)), _first(tags.get(0x202))
@@ -182,6 +220,7 @@ def _cr3(buf) -> tuple[PhotoMeta, list[tuple[int, int]]]:
         return region[i + 4:i - 4 + size]
 
     c1, c2 = cmt(b"CMT1"), cmt(b"CMT2")
+    t1, t2 = {}, {}
     if c1:
         t1 = _tiff_block_meta(c1, 0)
         meta.orientation = _first(t1.get(0x0112), 1) or 1
@@ -194,6 +233,7 @@ def _cr3(buf) -> tuple[PhotoMeta, list[tuple[int, int]]]:
             ct = _parse_dt(t2.get(0x9003), t2.get(0x9291))
             if ct:
                 meta.capture_time = ct
+    _fill_exif(meta, t1, t2)
 
     # trak #1 -> mdia/minf/stbl -> stsz + co64/stco
     for t, s, e in _boxes(buf, ms, me):
@@ -287,6 +327,7 @@ def read_meta(path: str) -> PhotoMeta:
                 meta.orientation = ex.get(0x0112, 1) or 1
                 sub = ex.get_ifd(0x8769)
                 meta.capture_time = _parse_dt(sub.get(0x9003), sub.get(0x9291)) or _parse_dt(ex.get(0x0132))
+                _fill_exif(meta, dict(ex), dict(sub))
         except Exception:
             pass
         if meta.capture_time is None:

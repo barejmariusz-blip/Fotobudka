@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import io
 from dataclasses import dataclass, field
+from functools import lru_cache
 
 import numpy as np
 from PIL import Image
@@ -38,7 +39,7 @@ def open_jpeg(data: bytes, max_edge: int | None, orientation: int) -> Image.Imag
     return apply_orientation(im, orientation)
 
 
-METRIC_VERSION = 2
+METRIC_VERSION = 3
 
 
 def _box1d(a: np.ndarray, k: int, axis: int) -> np.ndarray:
@@ -135,3 +136,70 @@ def suggest(scores: list[float | None], groups: list[Group], sensitivity: float)
                 rejects.add(i)
                 reasons[i] = "series"
     return rejects, rel, reasons
+
+
+# ------------------------------------------------------------------ ekspozycja
+OVER_CLIP = 0.10    # >10% kadru z wypalonym kanałem = prześwietlone (białe zwierzę ~3% to norma)
+UNDER_TOP = 170     # najjaśniejsze 0,5% kadru ciemniejsze niż 170/255 = niedoświetlone
+
+
+def exposure_stats(img: Image.Image) -> tuple[float, float, float]:
+    """(udział wypalonych pikseli, jasność najjaśniejszych 0,5%, średnia jasność 0..255).
+
+    Wypalony = którykolwiek kanał >= 253 (np. rudy kot potrafi wypalić tylko czerwony).
+    """
+    a = np.asarray(img.convert("RGB"))
+    mx = a.max(axis=2)
+    lum = a.astype(np.float32) @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
+    return float((mx >= 253).mean()), float(np.percentile(mx, 99.5)), float(lum.mean())
+
+
+def exposure_flag(ev) -> str | None:
+    if not ev:
+        return None
+    hi, top, _mean = ev
+    if hi > OVER_CLIP:
+        return "over"
+    if top < UNDER_TOP:
+        return "under"
+    return None
+
+
+# ------------------------------------------------------------------ podobne kadry
+def dhash(img: Image.Image, size: int = 16) -> str:
+    """Hash różnicowy 16x16 = 256 bitów (hex). Odporny na rozmycie i drobne zmiany."""
+    g = np.asarray(img.convert("L").resize((size + 1, size), Image.Resampling.BILINEAR), dtype=np.int16)
+    bits = (g[:, 1:] > g[:, :-1]).ravel()
+    return np.packbits(bits).tobytes().hex()
+
+
+@lru_cache(maxsize=20000)
+def _bits(h: str) -> np.ndarray:
+    return np.unpackbits(np.frombuffer(bytes.fromhex(h), dtype=np.uint8))
+
+
+def similarity_groups(hashes: list[str | None], threshold: float) -> list[list[int]]:
+    """Grupuje zdjęcia (w kolejności czasu) o podobieństwie >= threshold (0..1).
+
+    Zachłannie: zdjęcie trafia do grupy, której pierwsze zdjęcie jest najbardziej podobne
+    (bez „łańcuchowania”, które skleiłoby całą sesję na tym samym tle).
+    """
+    groups: list[list[int]] = []
+    R = np.zeros((len(hashes), 256), dtype=np.uint8)   # wzorce grup (pierwsze zdjęcie)
+    owner: list[int] = []
+    for i, h in enumerate(hashes):
+        if not h:
+            groups.append([i])
+            continue
+        b = _bits(h)
+        n = len(owner)
+        if n:
+            sims = 1.0 - np.count_nonzero(R[:n] != b, axis=1) / b.size
+            k = int(np.argmax(sims))
+            if sims[k] >= threshold:
+                groups[owner[k]].append(i)
+                continue
+        groups.append([i])
+        R[n] = b
+        owner.append(len(groups) - 1)
+    return groups

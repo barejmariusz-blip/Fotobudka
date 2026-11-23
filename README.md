@@ -10,6 +10,9 @@ Szybki program na Windows do przeglądania i odsiewu zdjęć po sesji (stworzony
 - **Ocenia ostrość** najostrzejszego fragmentu kadru, więc rozmyte tło (bokeh) nie zaniża wyniku.
 - Oznacza **„?” sugerowane do odrzutu**: zdjęcia nieostre i wyraźnie słabsze od najlepszego w serii. **TOP** to najostrzejsza klatka w serii.
 - Oceny 1–5★, odrzut i kolorowe etykiety zapisuje do plików **.xmp**, które czytają Lightroom, Capture One i Bridge.
+- **Serie wg czasu albo wg podobieństwa kadru**: w trybie podobieństwa łączy prawie identyczne ujęcia, nawet zrobione w odstępie minut, i wskazuje najlepsze z nich.
+- **Ekspozycja**: ☀ prześwietlone (ponad 10% kadru wypalone) i ☾ niedoświetlone. Oba mają osobne filtry.
+- **Filtr EXIF**: ISO, czas naświetlania (np. dłuższy niż 1/250 s, czyli ryzyko poruszenia), przysłona, ogniskowa, obiektyw, aparat.
 - **Kopiuj wybrane** kopiuje zdjęcia z oceną ≥ N do innego folderu. **Przenieś odrzucone** przenosi je do podfolderu `_ODRZUCONE`; nic nie jest kasowane.
 - **Lista nazw** kopiuje do schowka nazwy plików wybranych zdjęć.
 - Postęp zapisuje się sam w pliku `.fotobudka.json` w folderze sesji. Analiza liczy się raz, a po ponownym otwarciu folderu wszystko jest od razu gotowe.

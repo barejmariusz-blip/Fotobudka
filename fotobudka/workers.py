@@ -20,7 +20,7 @@ def pil_to_qimage(im) -> QImage:
 
 class Signals(QObject):
     meta_done = Signal(int, int, object)                 # gen, idx, PhotoMeta | None
-    analyzed = Signal(int, int, object, object)          # gen, idx, score | None, QImage | None
+    analyzed = Signal(int, int, object, object, object)  # gen, idx, score | None, QImage | None, extras | None
     view_loaded = Signal(int, int, bool, object)         # gen, idx, full, QImage | None
     progress = Signal(int, int, str)                     # done, total, current name
     finished = Signal(int, int, list)                    # ok, failed, errors
@@ -48,18 +48,20 @@ class AnalyzeTask(QRunnable):
     def run(self):
         score = None
         thumb = None
+        extras = None
         try:
             data = raw.read_preview_bytes(self.path, self.meta)
             if self.need_score:
                 im = analysis.open_jpeg(data, analysis.ANALYSIS_EDGE, self.meta.orientation)
                 score = analysis.sharpness_score(im)
+                extras = {"ev": analysis.exposure_stats(im), "h": analysis.dhash(im)}
             else:
                 im = analysis.open_jpeg(data, analysis.THUMB_EDGE * 2, self.meta.orientation)
             im.thumbnail((analysis.THUMB_EDGE, analysis.THUMB_EDGE))
             thumb = pil_to_qimage(im)
         except Exception:
             pass
-        self.sig.analyzed.emit(self.gen, self.idx, score, thumb)
+        self.sig.analyzed.emit(self.gen, self.idx, score, thumb, extras)
 
 
 class ViewTask(QRunnable):
