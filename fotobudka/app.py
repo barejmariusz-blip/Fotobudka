@@ -637,14 +637,17 @@ class MainWindow(QMainWindow):
         self.exif_btn.clicked.connect(self.open_exif_filter)
         tb.addWidget(self.exif_btn)
         self.exif_dlg = None
-        tb.addWidget(QLabel("  Zwierzę: "))
+        atb = QToolBar("Zwierzęta")
+        atb.setMovable(False)
+        self._animal_tb = atb
+        atb.addWidget(QLabel(" Zwierzę / osoba: "))
         self.animal_box = QComboBox()
         self.animal_box.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.animal_box.setMinimumWidth(170)
         self.animal_box.setToolTip("Pokaż zdjęcia tylko jednego zwierzęcia (rozpoznawane po kolorach obiektu w ostrości)")
         self.animal_box.addItem("wszystkie", -1)
         self.animal_box.currentIndexChanged.connect(lambda _: self.apply_filter())
-        tb.addWidget(self.animal_box)
+        atb.addWidget(self.animal_box)
         self.k_spin = QSpinBox()
         self.k_spin.setRange(0, 8)
         self.k_spin.setSpecialValueText("ile: auto")
@@ -652,18 +655,29 @@ class MainWindow(QMainWindow):
         self.k_spin.setToolTip("Ile zwierząt jest na sesji (auto = program sam ocenia)")
         self.k_spin.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         self.k_spin.valueChanged.connect(lambda _: self._settings_changed())
-        tb.addWidget(self.k_spin)
+        atb.addWidget(self.k_spin)
+        self.sep_spin = QSpinBox()
+        self.sep_spin.setRange(1, 10)
+        self.sep_spin.setValue(5)
+        self.sep_spin.setPrefix("rozdz.: ")
+        self.sep_spin.setToolTip("Jak ostro AI rozdziela zwierzęta:\n"
+                                 "niżej = łączy śmielej (mniej grup), wyżej = rozdziela dokładniej (więcej grup).\n"
+                                 "Działa po kliknięciu Przelicz.")
+        self.sep_spin.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        self.sep_spin.valueChanged.connect(lambda _: self._settings_changed())
+        atb.addWidget(self.sep_spin)
+        self.applied_sep = 5
         self.rename_btn = QPushButton("✎")
         self.rename_btn.setFixedWidth(28)
         self.rename_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.rename_btn.setToolTip("Nazwij wybraną grupę (np. „Pani Ania – Luna”). Nazwa zostaje przy kolejnych otwarciach.")
         self.rename_btn.clicked.connect(self.rename_animal)
-        tb.addWidget(self.rename_btn)
+        atb.addWidget(self.rename_btn)
         self.ai_btn = QPushButton("🐾 AI")
         self.ai_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.ai_btn.setStyleSheet("QPushButton{padding:3px 8px;}")
         self.ai_btn.clicked.connect(self.ai_button)
-        tb.addWidget(self.ai_btn)
+        atb.addWidget(self.ai_btn)
         self.animals: list[dict] = []
         self.applied_k = 0
         self._ak_cache: dict = {}
@@ -732,6 +746,9 @@ class MainWindow(QMainWindow):
         self.auto_xmp.setToolTip("Zapisuj pliki .xmp na bieżąco")
         self.auto_xmp.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         tb.addWidget(self.auto_xmp)
+
+        self.addToolBarBreak()
+        self.addToolBar(self._animal_tb)
 
         # centrum
         self.viewer = Viewer(self)
@@ -863,6 +880,10 @@ class MainWindow(QMainWindow):
         self.applied_sens, self.applied_gap = self.sens.value(), self.gap.value()
         self.k_spin.blockSignals(True)
         self.k_spin.setValue(int(s.value("k", 0)))
+        self.sep_spin.blockSignals(True)
+        self.sep_spin.setValue(int(s.value("sep", 5)))
+        self.sep_spin.blockSignals(False)
+        self.applied_sep = self.sep_spin.value()
         self.k_spin.blockSignals(False)
         self.applied_mode, self.applied_sim = self.mode_box.currentData(), self.sim.value()
         self.applied_k = self.k_spin.value()
@@ -882,6 +903,7 @@ class MainWindow(QMainWindow):
         s.setValue("mode", self.mode_box.currentData())
         s.setValue("sim", self.sim.value())
         s.setValue("k", self.k_spin.value())
+        s.setValue("sep", self.sep_spin.value())
         s.setValue("auto_adv", self.auto_adv.isChecked())
         s.setValue("auto_xmp", self.auto_xmp.isChecked())
         self.pool.clear()
@@ -1118,7 +1140,7 @@ class MainWindow(QMainWindow):
         mode = self.mode_box.currentData()
         pending = (self.sens.value() != self.applied_sens or abs(self.gap.value() - self.applied_gap) > 1e-9
                    or mode != self.applied_mode or (mode == "sim" and self.sim.value() != self.applied_sim)
-                   or self.k_spin.value() != self.applied_k)
+                   or self.k_spin.value() != self.applied_k or self.sep_spin.value() != self.applied_sep)
         ready = bool(self.photos) and not self.analysis_running
         self.recalc_btn.setEnabled(pending and ready)
         if pending and ready:
@@ -1126,7 +1148,10 @@ class MainWindow(QMainWindow):
             new = self._count_pending(self.sens.value(), self.gap.value(), mode, self.sim.value())
             diff = new - now
             ng = sum(1 for g in self._group_lists(mode, self.gap.value(), self.sim.value()) if len(g) > 1)
+            sep0 = self.applied_sep
+            self.applied_sep = self.sep_spin.value()
             na = len(set(x for x in self._animal_labels(self.k_spin.value()) if x >= 0))
+            self.applied_sep = sep0
             self.preview_lbl.setText(f"po przeliczeniu: {ng} grup, {new} do odrzutu ({'+' if diff >= 0 else ''}{diff}), "
                                      f"{na} zwierz.")
         elif pending and self.analysis_running:
@@ -1136,7 +1161,7 @@ class MainWindow(QMainWindow):
 
     def _animal_labels(self, k: int) -> list[int]:
         key = (k, len(self.photos), sum(1 for p in self.photos if p.csig), sum(1 for p in self.photos if p.ai),
-               tuple(p.name for p in self.photos[:3]), self.applied_mode)
+               tuple(p.name for p in self.photos[:3]), self.applied_mode, self.applied_sep)
         if key not in self._ak_cache:
             self._ak_cache = {kk: v for kk, v in self._ak_cache.items() if kk[1:] == key[1:]}
             if self._ai_mode():
@@ -1147,7 +1172,9 @@ class MainWindow(QMainWindow):
                 self._ak_cache[key] = (analysis.animal_clusters([p.csig for p in self.photos], k), None)
         return self._ak_cache[key][0]
 
-    AI_THRESHOLD = 0.55
+    @property
+    def AI_THRESHOLD(self) -> float:
+        return 0.45 + (self.applied_sep - 1) * 0.04      # 5 -> 0.61 (test: ten sam osobnik ~0.90, inny ~0.36)
 
     def _ai_mode(self) -> bool:
         return bool(self.photos) and all(p.ai is not None or p.failed for p in self.photos) \
@@ -1155,6 +1182,7 @@ class MainWindow(QMainWindow):
 
     def _cluster_animals(self):
         self.applied_k = self.k_spin.value()
+        self.applied_sep = self.sep_spin.value()
         if not self.photos or any(p.csig is None and not p.failed for p in self.photos):
             return
         labels = self._animal_labels(self.applied_k)
