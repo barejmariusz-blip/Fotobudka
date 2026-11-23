@@ -116,8 +116,10 @@
     s = s.replace(/-/g, "+").replace(/_/g, "/"); while (s.length % 4) s += "=";
     return Uint8Array.from(atob(s), c => c.charCodeAt(0));
   }
-  async function getDec(path) {
-    const r = await fetch(path, { cache: "force-cache" });
+  async function getDec(path, fresh) {
+    // opis galerii zawsze świeży (żeby nie trzymać w pamięci starego błędu 404 sprzed publikacji)
+    let r = await fetch(path, { cache: fresh ? "no-cache" : "default" });
+    if (!r.ok) r = await fetch(path, { cache: "reload" });
     if (!r.ok) throw new Error("HTTP " + r.status);
     const buf = new Uint8Array(await r.arrayBuffer());
     return crypto.subtle.decrypt({ name: "AES-GCM", iv: buf.slice(0, 12) }, key, buf.slice(12));
@@ -244,7 +246,7 @@
     if (!window.crypto || !crypto.subtle) return fail("Ta przeglądarka nie obsługuje galerii. Otwórz link w Chrome lub Safari.");
     try { key = await crypto.subtle.importKey("raw", b64u(keyStr), "AES-GCM", false, ["decrypt"]); }
     catch (e) { return fail("Nieprawidłowy link do galerii."); }
-    try { M = JSON.parse(new TextDecoder().decode(await getDec(`g/${gid}/m.bin`))); }
+    try { M = JSON.parse(new TextDecoder().decode(await getDec(`g/${gid}/m.bin`, true))); }
     catch (e) { return fail(`Nie udało się otworzyć galerii (${e.message || e}).<br>Jeśli galeria została właśnie opublikowana, odczekaj 1–2 minuty i odśwież stronę.`); }
     document.title = M.title || "Galeria";
     $("title").textContent = M.title || "Galeria";
