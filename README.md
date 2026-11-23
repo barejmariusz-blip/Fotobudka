@@ -17,6 +17,13 @@ Szybki program na Windows do przeglądania i odsiewu zdjęć po sesji (stworzony
 - **Lista nazw** kopiuje do schowka nazwy plików wybranych zdjęć.
 - Postęp zapisuje się sam w pliku `.fotobudka.json` w folderze sesji. Analiza liczy się raz, a po ponownym otwarciu folderu wszystko jest od razu gotowe.
 
+## Galerie dla klientów
+- **🖼 Galeria dla klienta…** publikuje wybrane zdjęcia (zmniejszone, ze znakiem wodnym) na GitHub Pages w repo `galerie` i daje link dla klienta.
+- Zdjęcia w repo są **zaszyfrowane** (AES-256). Klucz jest tylko w linku, w części po `#`, która nie trafia na serwer.
+- Klient zaznacza ♥ i klika „Wyślij wybór” (SMS / WhatsApp / e-mail / kopiuj). W **📥 Wybór klienta** wklejasz wiadomość, a zdjęcia dostają zieloną etykietę.
+- **🗂 Moje galerie**: linki, usuwanie, wczytywanie wyboru, porządki w repo.
+- Jednorazowo: publiczne repo `galerie` i token fine-grained (Contents + Pages: read & write) wpisany w ustawieniach galerii.
+
 ## Skróty
 | Klawisz | Akcja |
 |---|---|

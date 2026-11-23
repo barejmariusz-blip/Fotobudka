@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDia
                                QSlider, QSpinBox, QSplitter, QStyle, QStyledItemDelegate, QToolBar,
                                QVBoxLayout, QWidget)
 
-from . import ai, analysis, raw, storage
+from . import ai, analysis, gallery, gallery_ui, raw, storage
 from .workers import AITask, AnalyzeTask, DownloadTask, FileOpTask, MetaTask, Signals, ViewTask
 
 APP_NAME = "Fotobudka"
@@ -615,6 +615,12 @@ class MainWindow(QMainWindow):
         act("📤 Kopiuj wybrane…", lambda: self.export(False), None, "Skopiuj wybrane zdjęcia do innego folderu")
         act("🗑 Przenieś odrzucone…", self.move_rejected, None, "Przenieś odrzucone do podfolderu _ODRZUCONE")
         act("📋 Lista nazw", self.copy_names, None, "Skopiuj do schowka nazwy plików wybranych zdjęć")
+        tb.addSeparator()
+        act("🖼 Galeria dla klienta…", self.create_gallery, None,
+            "Opublikuj zdjęcia jako galerię online – klient wybiera ♥, Ty dostajesz listę")
+        act("🗂 Moje galerie", self.show_galleries, None, "Lista galerii: linki, usuwanie, wczytanie wyboru klienta")
+        act("📥 Wybór klienta", lambda: self.import_selection(None), None,
+            "Wklej wiadomość od klienta z wybranymi zdjęciami – zostaną oznaczone")
         self.addToolBarBreak()
         tb = QToolBar("Selekcja")
         tb.setMovable(False)
@@ -2190,6 +2196,116 @@ class MainWindow(QMainWindow):
         sig.finished.connect(done)
         self._fileop_sig = sig  # utrzymanie referencji
         self.pool.start(task, 10)
+
+    # ------------------------------------------------------------------ galerie dla klientów
+    @property
+    def gallery_reg(self) -> dict:
+        if not hasattr(self, "_gallery_reg"):
+            self._gallery_reg = gallery.load_registry()
+        return self._gallery_reg
+
+    def create_gallery(self):
+        if not self.photos:
+            QMessageBox.information(self, APP_NAME, "Najpierw otwórz folder z sesją.")
+            return
+        reg = self.gallery_reg
+        if not gallery_ui.ensure_settings(self, reg):
+            return
+        ok_p = [p for p in self.photos if not p.rejected and not p.failed and p.meta]
+        n_rated = {r: sum(1 for p in ok_p if p.rating >= r) for r in range(1, 6)}
+        n_rated[0] = len(ok_p)
+        visible = [self.photos[i] for i in self.model.rows if not self.photos[i].rejected and not self.photos[i].failed]
+        title = os.path.basename(self.folder.rstrip("/\\"))
+        d = self.animal_box.currentData()
+        if d is not None and d >= 0 and d < len(self.animals):
+            title = self.animals[d]["name"].rstrip("?")
+        elif d is not None and d >= 1000 and d - 1000 < len(self.owners):
+            title = self.owners[d - 1000]["name"]
+        dlg = gallery_ui.CreateDialog(self, len(visible), n_rated, title)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        src = dlg.src.currentData()
+        sel = visible if src == "visible" else [p for p in ok_p if p.rating >= int(src[1:])]
+        if not sel:
+            QMessageBox.information(self, APP_NAME, "Brak zdjęć do galerii.")
+            return
+        if len(sel) > 400 and QMessageBox.question(self, APP_NAME, f"To aż {len(sel)} zdjęć – na pewno?") \
+                != QMessageBox.StandardButton.Yes:
+            return
+        s = reg["settings"]
+        info = {"title": dlg.title.text().strip() or title, "max": dlg.max.value(),
+                "note": dlg.note.toPlainText().strip(), "studio": s.get("studio", ""),
+                "email": s.get("email", ""), "phone": s.get("phone", "")}
+        items = [(p.path, p.meta, os.path.splitext(p.name)[0]) for p in sel]
+        folder = self.folder
+
+        def done(g, err):
+            if err:
+                QMessageBox.warning(self, APP_NAME, f"Nie udało się opublikować galerii:\n{err}")
+                return
+            g["folder"] = folder
+            reg["galleries"].append(g)
+            gallery.save_registry(reg)
+            gallery_ui.LinkDialog(self, gallery.gallery_link(s, g), g["title"], True).exec()
+        gallery_ui.run_job(self, "Przygotowanie galerii…",
+                           lambda prog, canc: gallery.publish(s, items, info, s.get("watermark", ""), prog, canc), done)
+
+    def show_galleries(self):
+        gallery_ui.ManagerDialog(self).exec()
+
+    def import_selection(self, g):
+        reg = self.gallery_reg
+        if g is not None and self.folder and os.path.normcase(g.get("folder", "")) != os.path.normcase(self.folder):
+            if g.get("folder") and os.path.isdir(g["folder"]):
+                if QMessageBox.question(self, APP_NAME, f"Ta galeria jest z folderu:\n{g['folder']}\nOtworzyć go?") \
+                        != QMessageBox.StandardButton.Yes:
+                    return
+                self.open_folder(g["folder"])
+        elif g is not None and not self.folder and g.get("folder") and os.path.isdir(g["folder"]):
+            self.open_folder(g["folder"])
+        if not self.photos:
+            QMessageBox.information(self, APP_NAME, "Najpierw otwórz folder z sesją.")
+            return
+        if g is None:
+            mine = [x for x in reg["galleries"] if os.path.normcase(x.get("folder", "")) == os.path.normcase(self.folder)]
+            if len(mine) == 1:
+                g = mine[0]
+            elif len(mine) > 1:
+                titles = [f"{x['title']} ({time.strftime('%d.%m %H:%M', time.localtime(x['created']))})" for x in reversed(mine)]
+                t, ok = QInputDialog.getItem(self, APP_NAME, "Której galerii dotyczy wybór?", titles, 0, False)
+                if not ok:
+                    return
+                g = list(reversed(mine))[titles.index(t)]
+        dlg = gallery_ui.SelectionDialog(self, g["title"] if g else os.path.basename(self.folder))
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        found, unknown = gallery.parse_selection(dlg.text.toPlainText(), [p.name for p in self.photos])
+        if not found:
+            QMessageBox.warning(self, APP_NAME, "Nie znalazłem w tekście nazw zdjęć z tego folderu.")
+            return
+        mode = dlg.mark.currentData()
+        idxs = [i for i, p in enumerate(self.photos) if p.name in found]
+        self.undo.append(self._snapshot(idxs))
+        for i in idxs:
+            p = self.photos[i]
+            if mode in ("Green", "both"):
+                p.label = "Green"
+            if mode in ("r5", "both"):
+                p.rating, p.rejected = 5, False
+        self._changed(idxs)
+        if dlg.show_only.isChecked():
+            names = [n for n, _ in FILTERS]
+            self.filter_box.setCurrentIndex(names.index("Z etykietą") if mode != "r5" else names.index("Ocenione ≥ 4★"))
+        txt = f"📥 <b>Wybór klienta</b>{(' – ' + g['title']) if g else ''}: oznaczono <b>{len(found)}</b> zdjęć."
+        if g and g.get("max"):
+            txt += f" (pakiet: {g['max']})"
+        if unknown:
+            txt += f"<br><span style='color:#e0a060'>Nie znaleziono w folderze: {', '.join(unknown[:10])}</span>"
+        txt += "<br>Cofnięcie: Ctrl+Z."
+        self.banner_lbl.setText(txt)
+        self.banner_apply.setVisible(False)
+        self.banner.setStyleSheet("background:#1f3d2a; color:#e6e6e6;")
+        self.banner.setVisible(True)
 
     def copy_names(self):
         sel = self._selected_by_dialog("Lista nazw plików")
