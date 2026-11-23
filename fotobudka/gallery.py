@@ -401,9 +401,31 @@ def publish(settings: dict, items, info: dict, wm, progress=None, cancelled=lamb
         warn = ("GitHub Pages nie jest włączone, a token nie ma uprawnienia, żeby włączyć je sam.\n"
                 f"Włącz raz ręcznie: repo {settings['repo']} → Settings → Pages → Source: „Deploy from a branch” → "
                 f"Branch: {branch}, folder: / (root) → Save.\nGaleria jest już wysłana – link zadziała 1–2 minuty po włączeniu.")
+    if not warn:
+        wait_live(settings, gid, progress, cancelled)
     return {"id": gid, "key": key, "title": info.get("title", ""), "count": len(items),
             "created": int(time.time()), "max": info.get("max", 0),
             "names": [n for _, _, n in items], "warn": warn}
+
+
+def wait_live(settings: dict, gid: str, progress=None, cancelled=lambda: False, limit: int = 300) -> bool:
+    """Czeka, aż GitHub Pages zacznie serwować galerię (żeby klient nie trafił na błąd 404)."""
+    url = f"{site_url(settings)}g/{gid}/m.bin?check={int(time.time())}"
+    t0 = time.time()
+    while time.time() - t0 < limit:
+        if cancelled():
+            return False
+        try:
+            req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "Fotobudka", "Cache-Control": "no-cache"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                if r.status == 200:
+                    return True
+        except Exception:  # noqa: BLE001
+            pass
+        if progress:
+            progress(int(time.time() - t0), limit, "Czekam, aż GitHub opublikuje stronę (zwykle 1–2 min) – sekundy")
+        time.sleep(5)
+    return False
 
 
 def delete(settings: dict, gid: str):
