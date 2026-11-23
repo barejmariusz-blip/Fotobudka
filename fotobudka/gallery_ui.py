@@ -68,6 +68,7 @@ class SettingsDialog(QDialog):
         self.token.setEchoMode(QLineEdit.EchoMode.Password)
         self.token.setPlaceholderText("github_pat_…")
         lay.addRow("Użytkownik:", self.owner)
+        self.repo.setPlaceholderText("nazwa repo albo cały link z GitHuba")
         lay.addRow("Repozytorium:", self.repo)
         lay.addRow("Token:", self.token)
         lay.addRow(QLabel("<span style='color:#888'>Token zostaje tylko na tym komputerze.</span>"))
@@ -92,7 +93,8 @@ class SettingsDialog(QDialog):
         lay.addRow(bb)
 
     def values(self):
-        return {"owner": self.owner.text().strip(), "repo": self.repo.text().strip(), "token": self.token.text().strip(),
+        owner, repo = gallery.parse_repo(self.owner.text(), self.repo.text())
+        return {"owner": owner, "repo": repo, "token": self.token.text().strip(),
                 "studio": self.studio.text().strip(), "watermark": self.wm.text().strip(),
                 "email": self.email.text().strip(), "phone": self.phone.text().strip()}
 
@@ -101,6 +103,10 @@ class SettingsDialog(QDialog):
         try:
             gh = gallery.GitHub(v["owner"], v["repo"], v["token"])
             branch = gh.check()
+            if gh.repo != v["repo"] or gh.owner != v["owner"]:
+                self.owner.setText(gh.owner)
+                self.repo.setText(gh.repo)
+                v = self.values()
             gh.ensure_initialized(branch)
             gh.ensure_pages(branch)
             QMessageBox.information(self, APP, f"Działa ✔\nGalerie będą pod adresem:\n{gallery.site_url(v)}")

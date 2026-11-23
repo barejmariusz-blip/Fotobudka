@@ -58,6 +58,20 @@ def save_registry(reg: dict) -> None:
     os.replace(p + ".tmp", p)
 
 
+def parse_repo(owner: str, repo: str) -> tuple[str, str]:
+    """Akceptuje nazwę, nazwę ze spacjami albo wklejony link https://github.com/user/repo(.git)."""
+    import re
+    owner, repo = owner.strip(), repo.strip()
+    m = re.search(r"github\.com[/:]([^/\s]+)/([^/\s#?]+)", repo)
+    if m:
+        owner, repo = m.group(1), m.group(2)
+    if repo.endswith(".git"):
+        repo = repo[:-4]
+    repo = re.sub(r"[^A-Za-z0-9._-]+", "-", repo).strip("-")   # GitHub zamienia spacje na „-”
+    owner = re.sub(r"[^A-Za-z0-9-]+", "", owner)
+    return owner, repo
+
+
 def b64u(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).decode().rstrip("=")
 
@@ -223,6 +237,9 @@ class GitHub:
             if "401" in str(e):
                 raise GitHubError("Token jest nieprawidłowy albo wygasł.")
             raise
+        full = r.get("full_name", "")
+        if "/" in full:
+            self.owner, self.repo = full.split("/", 1)       # prawdziwa nazwa (wielkość liter)
         if r.get("private"):
             raise GitHubError("Repozytorium jest prywatne – GitHub Pages za darmo działa tylko dla publicznych.")
         return r.get("default_branch") or "main"
@@ -317,6 +334,7 @@ def _short(s: str) -> str:
 
 # --------------------------------------------------------------------------- wysokopoziomowo
 def publish(settings: dict, items, info: dict, wm: str, progress=None, cancelled=lambda: False) -> dict:
+    settings["owner"], settings["repo"] = parse_repo(settings["owner"], settings["repo"])
     gh = GitHub(settings["owner"], settings["repo"], settings["token"])
     branch = gh.check()
     gid, key, files = build_files(items, info, wm, progress, cancelled)
