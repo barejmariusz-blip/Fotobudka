@@ -60,6 +60,8 @@ def augment(im, rng):
 def main():
     os.makedirs(ai.data_dir(), exist_ok=True)
     for k, m in ai.MODELS.items():
+        if not os.path.exists(os.path.join("ai_cache", m["file"])):
+            continue
         shutil.copy(os.path.join("ai_cache", m["file"]), ai.model_path(k))
     rng = np.random.default_rng(0)
     items = []   # (rasa, id zdjęcia, obraz)
@@ -114,6 +116,21 @@ def main():
     for i in ok:
         gh.setdefault(items[i][0], []).append(res[i]["c"])
     print("::notice::Rasa dla grupy: " + ", ".join(f"{t}->{ai.name_for(v)[0]}" for t, v in gh.items()))
+    # wyszukiwanie opisem po polsku
+    queries = {"dalmatyńczyk": "Dalmatian", "biały pies w czarne łatki": "Dalmatian", "mops": "Pug",
+               "husky z niebieskimi oczami": "Husky", "szary kot": "BritishSH", "rudy pies": "Golden",
+               "corgi": "Corgi", "duży puszysty kot": "Maine", "czarno-biały pies pasterski": "Border"}
+    tags_all = np.array([t for t, _, _ in items])
+    for q, want in queries.items():
+        t = ai.text_embed(q)
+        sc = ai.search_scores(t, res)
+        sel = ai.search_select(sc, 1.9)
+        top = np.argsort(-np.nan_to_num(sc, nan=-9))[:10]
+        p10 = float(np.mean(tags_all[top] == want))
+        prec = float(np.mean(tags_all[sel] == want)) if sel.any() else float("nan")
+        rec = float(np.sum(tags_all[sel] == want) / max(1, np.sum(tags_all == want)))
+        print(f"::notice::Szukaj „{q}”: trafność top10 {p10:.0%}; wybrane {int(sel.sum())}, z tego trafne {prec:.0%}, znalezione {rec:.0%} z {want}")
+
 
 
 try:

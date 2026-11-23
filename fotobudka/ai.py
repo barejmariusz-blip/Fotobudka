@@ -29,7 +29,7 @@ try:
 except ImportError:  # wersja deweloperska
     MODELS = {}
 
-AI_VERSION = 2
+AI_VERSION = 3
 CLIP_MEAN = np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
 CLIP_STD = np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)
 IMNET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
@@ -64,25 +64,27 @@ def available() -> bool:
     return bool(MODELS)
 
 
-def missing() -> list[str]:
+def missing(group: str = "core") -> list[str]:
     out = []
     for k, m in MODELS.items():
+        if m.get("group", "core") != group:
+            continue
         p = model_path(k)
         if not (os.path.exists(p) and os.path.getsize(p) == m["size"]):
             out.append(k)
     return out
 
 
-def model_ready() -> bool:
-    return available() and not missing()
+def model_ready(group: str = "core") -> bool:
+    return available() and any(m.get("group", "core") == group for m in MODELS.values()) and not missing(group)
 
 
-def download_size() -> int:
-    return sum(MODELS[k]["size"] for k in missing())
+def download_size(group: str = "core") -> int:
+    return sum(MODELS[k]["size"] for k in missing(group))
 
 
-def download_models(progress=None, cancelled=lambda: False) -> None:
-    keys = missing()
+def download_models(progress=None, cancelled=lambda: False, group: str = "core") -> None:
+    keys = missing(group)
     total = sum(MODELS[k]["size"] for k in keys)
     done = 0
     for k in keys:
@@ -254,7 +256,7 @@ def analyze_image(im: Image.Image) -> dict:
         x0, y0, x1, y1 = d[2]
         return d[1] * ((x1 - x0) * (y1 - y0)) / (W * H)
 
-    out = {"a": None, "p": None, "c": None, "k": None}
+    out = {"a": None, "p": None, "c": None, "k": None, "f": clip(_center_square(im)), "q": None}
     if animals:
         a = max(animals, key=score)
         crop = square_crop(im, a[2], 0.08)
@@ -265,8 +267,19 @@ def analyze_image(im: Image.Image) -> dict:
         p = max(persons, key=score)
         x0, y0, x1, y1 = p[2]
         top = (x0, y0, x1, y0 + (y1 - y0) * 0.6)    # głowa, włosy i tułów
-        out["p"] = dino(square_crop(im, top, 0.05))
+        pc = square_crop(im, top, 0.05)
+        out["p"] = dino(pc)
+        out["q"] = clip(pc)
     return out
+
+
+def _center_square(im: Image.Image) -> Image.Image:
+    w, h = im.size
+    side = min(w, h)
+    return im.crop(((w - side) // 2, (h - side) // 2, (w + side) // 2, (h + side) // 2))
+
+
+EMB_KEYS = ("a", "p", "c", "f", "q")
 
 
 def analyze_photo(data: bytes, orientation: int) -> dict:
@@ -391,3 +404,49 @@ def name_for(clip_embs: list[np.ndarray]) -> tuple[str | None, float]:
     mean = p.mean(0)
     i = int(np.argmax(mean))
     return names[i], float(mean[i])
+
+
+# --------------------------------------------------------------------------- wyszukiwanie opisem (po polsku)
+_tok = None
+
+
+def text_embed(query: str) -> np.ndarray:
+    """Opis w dowolnym języku -> wektor w przestrzeni obrazów CLIP (wielojęzyczny CLIP)."""
+    global _tok
+    with _lock:
+        if _tok is None:
+            from tokenizers import Tokenizer
+            _tok = Tokenizer.from_file(model_path("mtok"))
+            _tok.no_padding()
+            _tok.enable_truncation(128)
+    enc = _tok.encode(query)
+    ids = np.array([enc.ids], dtype=np.int64)
+    mask = np.ones_like(ids)
+    sess = session("mtext")
+    feeds = {}
+    for i in sess.get_inputs():
+        feeds[i.name] = mask if "mask" in i.name else ids
+    return _norm(sess.run(None, feeds)[0])
+
+
+def search_scores(t: np.ndarray, photos: list[dict | None]) -> np.ndarray:
+    """Dopasowanie opisu do zdjęć: najlepsze z (zwierzę, osoba, cały kadr). NaN = brak danych."""
+    out = np.full(len(photos), np.nan, dtype=np.float32)
+    for i, r in enumerate(photos):
+        if not r:
+            continue
+        vals = [float(t @ r[k]) for k in ("c", "q", "f") if r.get(k) is not None]
+        if vals:
+            out[i] = max(vals)
+    return out
+
+
+def search_select(scores: np.ndarray, strictness: float = 1.0) -> np.ndarray:
+    """Które zdjęcia pasują: wynik wyraźnie powyżej typowego dla tej sesji (z-score)."""
+    v = scores[~np.isnan(scores)]
+    if len(v) < 3:
+        return ~np.isnan(scores)
+    med = float(np.median(v))
+    mad = float(np.median(np.abs(v - med))) * 1.4826 + 1e-6
+    z = (scores - med) / mad
+    return np.nan_to_num(z, nan=-99) >= strictness

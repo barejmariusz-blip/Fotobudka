@@ -68,6 +68,7 @@ class Photo:
     rel: float | None = None
     best: bool = False
     failed: bool = False
+    match: bool = False                  # pasuje do wyszukiwania opisem
     ev: tuple | None = None              # (wypalone, jasność top 0.5%, średnia)
     hash: str | None = None              # dHash do podobnych kadrów
     expo: str | None = None              # over / under
@@ -646,7 +647,7 @@ class MainWindow(QMainWindow):
         self.animal_box.setMinimumWidth(170)
         self.animal_box.setToolTip("Pokaż zdjęcia tylko jednego zwierzęcia (rozpoznawane po kolorach obiektu w ostrości)")
         self.animal_box.addItem("wszystkie", -1)
-        self.animal_box.currentIndexChanged.connect(lambda _: self.apply_filter())
+        self.animal_box.currentIndexChanged.connect(lambda _: self._animal_box_changed())
         atb.addWidget(self.animal_box)
         self.k_spin = QSpinBox()
         self.k_spin.setRange(0, 8)
@@ -678,6 +679,41 @@ class MainWindow(QMainWindow):
         self.ai_btn.setStyleSheet("QPushButton{padding:3px 8px;}")
         self.ai_btn.clicked.connect(self.ai_button)
         atb.addWidget(self.ai_btn)
+        atb.addSeparator()
+        from PySide6.QtWidgets import QLineEdit
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("🔎 opisz, np. „biały pies w czarne łatki”, „pani z rudymi włosami”")
+        self.search_edit.setMinimumWidth(340)
+        self.search_edit.setClearButtonEnabled(True)
+        self.search_edit.returnPressed.connect(self.run_search)
+        self.search_edit.textChanged.connect(lambda t: (not t) and self.clear_search())
+        atb.addWidget(self.search_edit)
+        self.search_btn = QPushButton("Szukaj")
+        self.search_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.search_btn.clicked.connect(self.run_search)
+        atb.addWidget(self.search_btn)
+        self.strict_spin = QSpinBox()
+        self.strict_spin.setRange(1, 10)
+        self.strict_spin.setValue(5)
+        self.strict_spin.setPrefix("ścisłość: ")
+        self.strict_spin.setToolTip("Niżej = więcej wyników (też mniej pewnych), wyżej = tylko najlepiej pasujące")
+        self.strict_spin.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        self.strict_spin.valueChanged.connect(lambda _: self.search_query and self._apply_search())
+        atb.addWidget(self.strict_spin)
+        self.whole_cb = QCheckBox("+ całe zwierzęta")
+        self.whole_cb.setChecked(True)
+        self.whole_cb.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.whole_cb.setToolTip("Dołącz wszystkie zdjęcia zwierząt (grup AI), które w większości pasują do opisu")
+        self.whole_cb.toggled.connect(lambda _: self.search_query and self._apply_search())
+        atb.addWidget(self.whole_cb)
+        self.save_search_btn = QPushButton("💾 Zapisz jako grupę")
+        self.save_search_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.save_search_btn.setEnabled(False)
+        self.save_search_btn.clicked.connect(self.save_search)
+        atb.addWidget(self.save_search_btn)
+        self.search_query = ""
+        self.search_scores = None
+        self.searches: list[dict] = []
         self.animals: list[dict] = []
         self.applied_k = 0
         self._ak_cache: dict = {}
@@ -932,6 +968,12 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"{APP_NAME} v{VERSION} – {folder}")
         self.state = storage.load_state(folder)
         self.animal_names = [n for n in self.state.get("names", []) if isinstance(n, dict) and n.get("v")]
+        self.searches = [x for x in self.state.get("searches", []) if isinstance(x, dict) and x.get("q")]
+        self.search_query = ""
+        self.search_scores = None
+        self.search_edit.blockSignals(True)
+        self.search_edit.clear()
+        self.search_edit.blockSignals(False)
         self.ai_running = False
         self.ai_left = 0
         self.photos = []
@@ -995,7 +1037,7 @@ class MainWindow(QMainWindow):
                     p.csig, p.cmean = s.get("c"), s.get("cm")
             if isinstance(s.get("ai"), dict) and s["ai"].get("v") == ai.AI_VERSION and p.meta is not None:
                 try:
-                    p.ai = {k: (ai.from_b64(s["ai"][k]) if s["ai"].get(k) else None) for k in ("a", "p", "c")}
+                    p.ai = {k: (ai.from_b64(s["ai"][k]) if s["ai"].get(k) else None) for k in ai.EMB_KEYS}
                     p.ai["k"] = s["ai"].get("k")
                 except Exception:
                     p.ai = None
@@ -1267,33 +1309,12 @@ class MainWindow(QMainWindow):
                                 "Zdjęcia nigdzie nie są wysyłane – wszystko liczy się na tym komputerze.") \
                 != QMessageBox.StandardButton.Yes:
             return
-        sig = Signals()
-        task = DownloadTask(sig)
-        dlg = QProgressDialog("Pobieranie modelu AI…", "Przerwij", 0, 100, self)
-        dlg.setWindowTitle(APP_NAME)
-        dlg.setWindowModality(Qt.WindowModality.WindowModal)
-        dlg.setMinimumDuration(0)
-        dlg.canceled.connect(lambda: setattr(task, "cancelled", True))
-        sig.dl_progress.connect(lambda d, t: (dlg.setMaximum(max(1, t // 1048576)), dlg.setValue(d // 1048576),
-                                              dlg.setLabelText(f"Pobieranie modelu AI… {d // 1048576} / {t // 1048576} MB")))
-
-        def done(err):
-            dlg.close()
-            if err:
-                QMessageBox.warning(self, APP_NAME, f"Nie udało się pobrać modelu:\n{err}")
-            else:
-                self.statusBar().showMessage("Model AI pobrany", 5000)
-                if self.photos and not self.analysis_running:
-                    self.start_ai()
-            self._update_ai_btn()
-        sig.dl_done.connect(done)
-        self._dl_sig = sig
-        self.pool.start(task, 10)
+        self._download("core", after=lambda: self.photos and not self.analysis_running and self.start_ai())
 
     def start_ai(self):
         if self.ai_running or not self.photos or self.analysis_running:
             return
-        todo = [i for i, p in enumerate(self.photos) if p.ai is None and not p.failed and p.meta]
+        todo = [i for i, p in enumerate(self.photos) if (p.ai is None or "f" not in p.ai) and not p.failed and p.meta]
         if not todo:
             self._cluster_animals()
             self.apply_filter()
@@ -1311,7 +1332,7 @@ class MainWindow(QMainWindow):
     def _on_ai(self, gen, idx, res):
         if gen != self.gen or not self.ai_running:
             return
-        self.photos[idx].ai = res if res is not None else {"a": None, "p": None, "c": None, "k": None}
+        self.photos[idx].ai = res if res is not None else {k: None for k in (*ai.EMB_KEYS, "k")}
         self.ai_left -= 1
         self._progress(self.ai_total - self.ai_left, self.ai_total,
                        "Etap 3/3 – rozpoznawanie zwierząt (AI)", eta_from=self.ai_t0)
@@ -1336,6 +1357,135 @@ class MainWindow(QMainWindow):
                 self.banner_apply.setVisible(False)
                 self.banner.setStyleSheet("background:#1f2f3d; color:#e6e6e6;")
                 self.banner.setVisible(True)
+
+    # ------------------------------------------------------------------ wyszukiwanie opisem
+    def _animal_box_changed(self):
+        d = self.animal_box.currentData()
+        if d is not None and d >= 2000 and d - 2000 < len(self.searches):
+            sv = self.searches[d - 2000]
+            self.strict_spin.blockSignals(True)
+            self.strict_spin.setValue(int(sv.get("s", 5)))
+            self.strict_spin.blockSignals(False)
+            self.whole_cb.blockSignals(True)
+            self.whole_cb.setChecked(bool(sv.get("w", True)))
+            self.whole_cb.blockSignals(False)
+            if not self._compute_search(sv["q"]):
+                return
+            self.search_query = ""          # filtr idzie przez pozycję listy, nie przez pole
+            self.apply_filter()
+            return
+        if self.search_query == "":
+            for p in self.photos:
+                p.match = False
+        self.apply_filter()
+
+    def _search_ready(self) -> bool:
+        if not self._ai_mode():
+            QMessageBox.information(self, APP_NAME, "Najpierw uruchom rozpoznawanie zwierząt (🐾 AI) dla tego folderu.")
+            return False
+        if any(p.ai and "f" not in p.ai for p in self.photos) or not any(p.ai and p.ai.get("f") is not None for p in self.photos):
+            QMessageBox.information(self, APP_NAME, "Ten folder był rozpoznany starszą wersją AI – kliknij 🐾 Uruchom AI ponownie.")
+            return False
+        if not ai.model_ready("search"):
+            mb = ai.download_size("search") // 1048576
+            if QMessageBox.question(self, APP_NAME, f"Wyszukiwanie opisem po polsku potrzebuje jeszcze jednego modelu "
+                                    f"(ok. {mb} MB, pobierany raz). Pobrać?") != QMessageBox.StandardButton.Yes:
+                return False
+            self._download("search", after=self.run_search)
+            return False
+        return True
+
+    def _compute_search(self, query: str) -> bool:
+        if not self._search_ready():
+            return False
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            t = ai.text_embed(query)
+            self.search_scores = ai.search_scores(t, [p.ai for p in self.photos])
+        finally:
+            QApplication.restoreOverrideCursor()
+        self._mark_matches()
+        return True
+
+    def _mark_matches(self):
+        strict = 0.5 + (self.strict_spin.value() - 1) * 0.35        # 5 -> 1.9 odchylenia ponad typowy wynik
+        sel = ai.search_select(self.search_scores, strict)
+        for p, m in zip(self.photos, sel):
+            p.match = bool(m)
+        if self.whole_cb.isChecked() and self.animals:
+            for c in range(len(self.animals)):
+                mem = [p for p in self.photos if p.animal == c]
+                if mem and sum(p.match for p in mem) >= 0.4 * len(mem):
+                    for p in mem:
+                        p.match = True
+
+    def run_search(self):
+        q = self.search_edit.text().strip()
+        if not q or not self.photos:
+            return
+        if not self._compute_search(q):
+            return
+        self.search_query = q
+        self.animal_box.blockSignals(True)
+        self.animal_box.setCurrentIndex(0)
+        self.animal_box.blockSignals(False)
+        self.save_search_btn.setEnabled(True)
+        self.apply_filter()
+        n = sum(p.match for p in self.photos)
+        self.statusBar().showMessage(f"„{q}”: {n} pasujących zdjęć", 8000)
+        rows = self.model.rows
+        if rows and self.cur not in [i for i in rows if self.photos[i].match]:
+            first = next((i for i in rows if self.photos[i].match), None)
+            if first is not None:
+                self.show_photo(first)
+
+    def _apply_search(self):
+        if self.search_scores is None:
+            return
+        self._mark_matches()
+        self.apply_filter()
+
+    def clear_search(self):
+        self.search_query = ""
+        self.search_scores = None
+        self.save_search_btn.setEnabled(False)
+        for p in self.photos:
+            p.match = False
+        self.apply_filter()
+
+    def save_search(self):
+        if not self.search_query:
+            return
+        q = self.search_query
+        self.searches = [x for x in self.searches if x["q"] != q]
+        self.searches.append({"q": q, "s": self.strict_spin.value(), "w": self.whole_cb.isChecked()})
+        self._fill_animal_box()
+        self._save_now()
+        self.statusBar().showMessage(f"Zapisano grupę „{q}” – jest na liście „Zwierzę / osoba”", 6000)
+
+    def _download(self, group: str, after=None):
+        sig = Signals()
+        task = DownloadTask(sig, group)
+        dlg = QProgressDialog("Pobieranie modelu AI…", "Przerwij", 0, 100, self)
+        dlg.setWindowTitle(APP_NAME)
+        dlg.setWindowModality(Qt.WindowModality.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.canceled.connect(lambda: setattr(task, "cancelled", True))
+        sig.dl_progress.connect(lambda d, t: (dlg.setMaximum(max(1, t // 1048576)), dlg.setValue(d // 1048576),
+                                              dlg.setLabelText(f"Pobieranie modelu AI… {d // 1048576} / {t // 1048576} MB")))
+
+        def done(err):
+            dlg.close()
+            if err:
+                QMessageBox.warning(self, APP_NAME, f"Nie udało się pobrać modelu:\n{err}")
+            else:
+                self.statusBar().showMessage("Model AI pobrany", 5000)
+                if after:
+                    after()
+            self._update_ai_btn()
+        sig.dl_done.connect(done)
+        setattr(self, f"_dl_sig_{group}", sig)
+        self.pool.start(task, 10)
 
     def rename_animal(self):
         c = self.animal_box.currentData()
@@ -1377,7 +1527,7 @@ class MainWindow(QMainWindow):
             pt.end()
             return QIcon(pm)
 
-        if len(self.animals) > 1 or self.owners:
+        if len(self.animals) > 1 or self.owners or self.searches:
             in_owner = {i for o in self.owners for i in o["animals"]}
             for oi, o in enumerate(self.owners):
                 names = " + ".join(self.animals[i]["name"].rstrip("?") for i in o["animals"])
@@ -1390,6 +1540,8 @@ class MainWindow(QMainWindow):
                 if i not in in_owner:
                     self.animal_box.addItem(icon([a["hex"]]), f"🐾 {a['name']} ({a['n']})", i)
             unk = sum(1 for p in self.photos if p.animal < 0)
+            for si, sv in enumerate(self.searches):
+                self.animal_box.addItem(f"🔎 {sv['q']}", 2000 + si)
             if unk and self._ai_mode():
                 self.animal_box.addItem(f"❔ nie rozpoznano zwierzęcia ({unk})", -2)
         idx = self.animal_box.findData(cur if cur is not None else -1)
@@ -1585,7 +1737,10 @@ class MainWindow(QMainWindow):
             am = lambda p: p.animal == an  # noqa: E731
         else:
             am = lambda p: True  # noqa: E731
-        rows = [i for i, p in enumerate(self.photos) if (pred(p) and ex(p) and am(p)) or i == self.cur]
+        if an >= 2000:
+            am = lambda p: p.match  # noqa: E731
+        sm = (lambda p: p.match) if self.search_query else (lambda p: True)
+        rows = [i for i, p in enumerate(self.photos) if (pred(p) and ex(p) and am(p) and sm(p)) or i == self.cur]
         self.model.set_rows(rows)
         self._select_current()
         self.viewer.update()
@@ -1828,7 +1983,7 @@ class MainWindow(QMainWindow):
                     d["c"], d["cm"] = p.csig, p.cmean
             if p.ai is not None:
                 d["ai"] = {"v": ai.AI_VERSION, "k": p.ai.get("k"),
-                           **{k: ai.to_b64(p.ai[k]) for k in ("a", "p", "c") if p.ai.get(k) is not None}}
+                           **{k: ai.to_b64(p.ai[k]) for k in ai.EMB_KEYS if p.ai.get(k) is not None}}
             if p.rating:
                 d["r"] = p.rating
             if p.rejected:
@@ -1838,7 +1993,8 @@ class MainWindow(QMainWindow):
             if p.label:
                 d["l"] = p.label
             out[p.name] = d
-        self.state = {"app": f"{APP_NAME} {VERSION}", "photos": out, "names": self.animal_names}
+        self.state = {"app": f"{APP_NAME} {VERSION}", "photos": out, "names": self.animal_names,
+                      "searches": self.searches}
         try:
             storage.save_state(self.folder, self.state)
         except OSError as e:

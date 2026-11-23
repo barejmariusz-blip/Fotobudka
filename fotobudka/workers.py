@@ -100,15 +100,16 @@ class AITask(QRunnable):
 
 
 class DownloadTask(QRunnable):
-    def __init__(self, sig: Signals):
+    def __init__(self, sig: Signals, group: str = "core"):
         super().__init__()
         self.sig = sig
+        self.group = group
         self.cancelled = False
 
     def run(self):
         try:
             from . import ai
-            ai.download_models(lambda d, t: self.sig.dl_progress.emit(d, t), lambda: self.cancelled)
+            ai.download_models(lambda d, t: self.sig.dl_progress.emit(d, t), lambda: self.cancelled, self.group)
             self.sig.dl_done.emit("")
         except Exception as e:
             self.sig.dl_done.emit(str(e) or e.__class__.__name__)
