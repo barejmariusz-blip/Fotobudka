@@ -68,6 +68,7 @@ class Photo:
     rel: float | None = None
     best: bool = False
     failed: bool = False
+    manual: str | None = None            # ręcznie przypisana nazwa zwierzęcia
     match: bool = False                  # pasuje do wyszukiwania opisem
     ev: tuple | None = None              # (wypalone, jasność top 0.5%, średnia)
     hash: str | None = None              # dHash do podobnych kadrów
@@ -535,6 +536,8 @@ O – przegląd odrzuconych<br>
 Z / Spacja / klik – zoom 100%<br>
 G / Shift+G – następna / poprzednia seria<br>
 B – najlepsze w serii<br>
+N – nazwij zwierzę z tego zdjęcia<br>
+M – przenieś zdjęcie do innego zwierzęcia<br>
 Ctrl+Z – cofnij<br>
 Ctrl+S – zapisz XMP<br>
 F11 – pełny ekran"""
@@ -680,6 +683,17 @@ class MainWindow(QMainWindow):
         self.ai_btn.clicked.connect(self.ai_button)
         atb.addWidget(self.ai_btn)
         atb.addSeparator()
+        self.name_btn = QPushButton("🏷 To zwierzę to… (N)")
+        self.name_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.name_btn.setToolTip("Wpisz imię / nazwę zwierzęcia z oglądanego zdjęcia.\n"
+                                 "AI przypisze ją wszystkim zdjęciom tego samego zwierzęcia.")
+        self.name_btn.clicked.connect(self.name_from_photo)
+        atb.addWidget(self.name_btn)
+        self.move_btn = QPushButton("↪ Przenieś do… (M)")
+        self.move_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.move_btn.setToolTip("Poprawka: przenieś oglądane zdjęcie (albo całą jego serię) do innego zwierzęcia")
+        self.move_btn.clicked.connect(self.move_photo)
+        atb.addWidget(self.move_btn)
         from PySide6.QtWidgets import QLineEdit
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("🔎 opisz, np. „biały pies w czarne łatki”, „pani z rudymi włosami”")
@@ -687,11 +701,11 @@ class MainWindow(QMainWindow):
         self.search_edit.setClearButtonEnabled(True)
         self.search_edit.returnPressed.connect(self.run_search)
         self.search_edit.textChanged.connect(lambda t: (not t) and self.clear_search())
-        atb.addWidget(self.search_edit)
+        atb.addWidget(self.search_edit).setVisible(False)
         self.search_btn = QPushButton("Szukaj")
         self.search_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.search_btn.clicked.connect(self.run_search)
-        atb.addWidget(self.search_btn)
+        atb.addWidget(self.search_btn).setVisible(False)
         self.strict_spin = QSpinBox()
         self.strict_spin.setRange(1, 10)
         self.strict_spin.setValue(5)
@@ -699,18 +713,18 @@ class MainWindow(QMainWindow):
         self.strict_spin.setToolTip("Niżej = więcej wyników (też mniej pewnych), wyżej = tylko najlepiej pasujące")
         self.strict_spin.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         self.strict_spin.valueChanged.connect(lambda _: self.search_query and self._apply_search())
-        atb.addWidget(self.strict_spin)
+        atb.addWidget(self.strict_spin).setVisible(False)
         self.whole_cb = QCheckBox("+ całe zwierzęta")
         self.whole_cb.setChecked(True)
         self.whole_cb.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.whole_cb.setToolTip("Dołącz wszystkie zdjęcia zwierząt (grup AI), które w większości pasują do opisu")
         self.whole_cb.toggled.connect(lambda _: self.search_query and self._apply_search())
-        atb.addWidget(self.whole_cb)
+        atb.addWidget(self.whole_cb).setVisible(False)
         self.save_search_btn = QPushButton("💾 Zapisz jako grupę")
         self.save_search_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.save_search_btn.setEnabled(False)
         self.save_search_btn.clicked.connect(self.save_search)
-        atb.addWidget(self.save_search_btn)
+        atb.addWidget(self.save_search_btn).setVisible(False)
         self.search_query = ""
         self.search_scores = None
         self.searches: list[dict] = []
@@ -890,6 +904,8 @@ class MainWindow(QMainWindow):
         sc("G", lambda: self.jump_group(1))
         sc("Shift+G", lambda: self.jump_group(-1))
         sc("B", self.jump_best)
+        sc("N", self.name_from_photo)
+        sc("M", self.move_photo)
         sc("Ctrl+Z", self.do_undo)
         sc("F11", self.toggle_fullscreen)
         sc("Escape", self._escape)
@@ -1026,6 +1042,7 @@ class MainWindow(QMainWindow):
             p.rating = int(s.get("r", 0))
             p.rejected = bool(s.get("x", False))
             p.rej_by = s.get("xb") if p.rejected else None
+            p.manual = s.get("an")
             p.label = s.get("l")
             if s.get("sz") == st.st_size and abs(s.get("mt", 0) - st.st_mtime) < 2 and "t" in s and "ex" in s:
                 p.meta = raw.PhotoMeta(s["t"], s.get("o", 1), s.get("po", 0), s.get("pl", 0))
@@ -1275,6 +1292,17 @@ class MainWindow(QMainWindow):
                 self.owners.append({"animals": ids, "centroid": cen, "custom": bool(nm),
                                     "name": nm or f"osoba {len(self.owners) + 1}",
                                     "n": sum(self.animals[i]["n"] for i in ids)})
+        # ręczne poprawki (M): zdjęcie idzie do zwierzęcia o tej nazwie
+        by_name = {a["name"]: i for i, a in enumerate(self.animals)}
+        for p in self.photos:
+            if p.manual:
+                if p.manual not in by_name:
+                    self.animals.append({"rgb": [128, 128, 128], "hex": "#808080", "n": 0, "name": p.manual,
+                                         "centroid": None, "custom": True})
+                    by_name[p.manual] = len(self.animals) - 1
+                p.animal = by_name[p.manual]
+        for i, a in enumerate(self.animals):
+            a["n"] = sum(1 for p in self.photos if p.animal == i)
         self._fill_animal_box()
 
     # ------------------------------------------------------------------ AI
@@ -1357,6 +1385,68 @@ class MainWindow(QMainWindow):
                 self.banner_apply.setVisible(False)
                 self.banner.setStyleSheet("background:#1f2f3d; color:#e6e6e6;")
                 self.banner.setVisible(True)
+
+    # ------------------------------------------------------------------ nazwy z przykładu / poprawki
+    def name_from_photo(self):
+        p = self.current_photo()
+        if not p:
+            return
+        if not self._ai_mode():
+            QMessageBox.information(self, APP_NAME, "Najpierw uruchom rozpoznawanie zwierząt (🐾 AI).")
+            return
+        if p.animal < 0 or p.animal >= len(self.animals):
+            QMessageBox.information(self, APP_NAME, "Na tym zdjęciu AI nie znalazło zwierzęcia. "
+                                    "Użyj „↪ Przenieś do…”, żeby przypisać je ręcznie.")
+            return
+        a = self.animals[p.animal]
+        name, ok = QInputDialog.getText(self, APP_NAME,
+                                        f"Jak ma się nazywać to zwierzę?\n(na razie: {a['name']}, {a['n']} zdjęć)",
+                                        text="" if not a.get("custom") else a["name"])
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        if a.get("centroid") is not None:
+            cen = a["centroid"]
+            self.animal_names = [n for n in self.animal_names
+                                 if n.get("t", "a") != "a" or float(ai.from_b64(n["v"]) @ cen) < 0.80]
+            self.animal_names.append({"v": ai.to_b64(cen), "n": name, "t": "a"})
+        old = a["name"]
+        a["name"], a["custom"] = name, True
+        for q in self.photos:
+            if q.manual == old:
+                q.manual = name
+        self._fill_animal_box()
+        self._update_info()
+        self._save_now()
+        self.statusBar().showMessage(f"„{name}”: {a['n']} zdjęć tego zwierzęcia", 6000)
+
+    def move_photo(self):
+        p = self.current_photo()
+        if not p or not self.animals:
+            return
+        names = [a["name"] for a in self.animals] + ["➕ nowe zwierzę…"]
+        cur = names[p.animal] if 0 <= p.animal < len(self.animals) else None
+        choice, ok = QInputDialog.getItem(self, APP_NAME, "Przenieś do zwierzęcia:", names,
+                                          max(0, names.index(cur)) if cur in names else 0, False)
+        if not ok:
+            return
+        if choice == names[-1]:
+            choice, ok = QInputDialog.getText(self, APP_NAME, "Nazwa nowego zwierzęcia:")
+            if not ok or not choice.strip():
+                return
+            choice = choice.strip()
+        targets = [p]
+        series = [q for q in self.photos if q.group == p.group and q is not p]
+        if series and QMessageBox.question(self, APP_NAME, f"Przenieść też pozostałe {len(series)} zdjęć z tej serii?") \
+                == QMessageBox.StandardButton.Yes:
+            targets += series
+        for q in targets:
+            q.manual = choice
+        self._cluster_animals()
+        self.apply_filter()
+        self._update_info()
+        self._save_now()
+        self.statusBar().showMessage(f"Przeniesiono {len(targets)} zdjęć do „{choice}”", 6000)
 
     # ------------------------------------------------------------------ wyszukiwanie opisem
     def _animal_box_changed(self):
@@ -1527,7 +1617,7 @@ class MainWindow(QMainWindow):
             pt.end()
             return QIcon(pm)
 
-        if len(self.animals) > 1 or self.owners or self.searches:
+        if len(self.animals) > 1 or self.owners:
             in_owner = {i for o in self.owners for i in o["animals"]}
             for oi, o in enumerate(self.owners):
                 names = " + ".join(self.animals[i]["name"].rstrip("?") for i in o["animals"])
@@ -1537,11 +1627,9 @@ class MainWindow(QMainWindow):
                     a = self.animals[i]
                     self.animal_box.addItem(icon([a["hex"]]), f"     🐾 {a['name']} ({a['n']})", i)
             for i, a in enumerate(self.animals):
-                if i not in in_owner:
+                if i not in in_owner and a["n"] > 0:
                     self.animal_box.addItem(icon([a["hex"]]), f"🐾 {a['name']} ({a['n']})", i)
             unk = sum(1 for p in self.photos if p.animal < 0)
-            for si, sv in enumerate(self.searches):
-                self.animal_box.addItem(f"🔎 {sv['q']}", 2000 + si)
             if unk and self._ai_mode():
                 self.animal_box.addItem(f"❔ nie rozpoznano zwierzęcia ({unk})", -2)
         idx = self.animal_box.findData(cur if cur is not None else -1)
@@ -1990,6 +2078,8 @@ class MainWindow(QMainWindow):
                 d["x"] = True
                 if p.rej_by:
                     d["xb"] = p.rej_by
+            if p.manual:
+                d["an"] = p.manual
             if p.label:
                 d["l"] = p.label
             out[p.name] = d
