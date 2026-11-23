@@ -116,29 +116,48 @@ def main():
     for i in ok:
         gh.setdefault(items[i][0], []).append(res[i]["c"])
     print("::notice::Rasa dla grupy: " + ", ".join(f"{t}->{ai.name_for(v)[0]}" for t, v in gh.items()))
-    # diagnostyka: czy tekst wielojęzyczny trafia w przestrzeń CLIP
-    names, T = ai.labels()
-    for pl_name, en in [("dalmatyńczyk", "a photo of a Dalmatian dog."), ("mops", "a photo of a Pug.")]:
-        j = names.index(pl_name)
-        a1, a2 = ai.text_embed(en), ai.text_embed(pl_name)
-        print(f"::warning::DIAG {pl_name}: cos(mclip EN, clip label)={float(a1 @ T[j]):.3f} cos(mclip PL, clip label)={float(a2 @ T[j]):.3f} "
-              f"cos(EN,PL)={float(a1 @ a2):.3f} tokens={ai._tok.encode(pl_name).tokens[:8]}")
     # wyszukiwanie opisem po polsku
     queries = {"dalmatyńczyk": "Dalmatian", "biały pies w czarne łatki": "Dalmatian", "mops": "Pug",
                "husky z niebieskimi oczami": "Husky", "szary kot": "BritishSH", "rudy pies": "Golden",
                "corgi": "Corgi", "duży puszysty kot": "Maine", "czarno-biały pies pasterski": "Border"}
     tags_all = np.array([t for t, _, _ in items])
+    names, T = ai.labels()
+    TE = {q: ai.text_embed(q) for q in queries}
+
+    def get(k):
+        return np.stack([r[k] if r and r.get(k) is not None else np.zeros(512, np.float32) for r in res])
+    C, F, Q = get("c"), get("f"), get("q")
+    hasC = np.array([bool(r and r.get("c") is not None) for r in res])
+    variants = {
+        "A_c_raw": lambda t: np.where(hasC, C @ t, F @ t),
+        "B_c_bank": lambda t: np.where(hasC, C @ t - (C @ T.T).mean(1), F @ t - (F @ T.T).mean(1)),
+        "C_max_bank": lambda t: np.maximum(np.where(hasC, C @ t - (C @ T.T).mean(1), -9), F @ t - (F @ T.T).mean(1)),
+        "D_softmax": lambda t: np.where(hasC, _soft(C, t, T), _soft(F, t, T)),
+        "E_f_bank": lambda t: F @ t - (F @ T.T).mean(1),
+    }
+    summary = []
+    for vn, fn in variants.items():
+        p10s = []
+        for q, want in queries.items():
+            sc = fn(TE[q])
+            top = np.argsort(-sc)[:10]
+            p10s.append(float(np.mean(tags_all[top] == want)))
+        summary.append(f"{vn}={np.mean(p10s):.0%}")
+    print("::warning::Szukaj top10 średnio: " + ", ".join(summary))
+    fn = variants["B_c_bank"]
     for q, want in queries.items():
-        t = ai.text_embed(q)
-        sc = ai.search_scores(t, res)
-        sel = ai.search_select(sc, 1.9)
-        top = np.argsort(-np.nan_to_num(sc, nan=-9))[:10]
-        p10 = float(np.mean(tags_all[top] == want))
-        prec = float(np.mean(tags_all[sel] == want)) if sel.any() else float("nan")
-        rec = float(np.sum(tags_all[sel] == want) / max(1, np.sum(tags_all == want)))
-        print(f"::warning::Szukaj „{q}”: trafność top10 {p10:.0%}; wybrane {int(sel.sum())}, z tego trafne {prec:.0%}, znalezione {rec:.0%} z {want}")
+        sc = fn(TE[q])
+        top = np.argsort(-sc)[:10]
+        sel = ai.search_select(sc.astype(np.float32), 1.9)
+        print(f"::warning::B „{q}”: top10 {np.mean(tags_all[top] == want):.0%}; wybrane {int(sel.sum())}, trafne "
+              f"{(np.mean(tags_all[sel] == want) if sel.any() else 0):.0%}, znalezione {np.sum(tags_all[sel] == want)}/{np.sum(tags_all == want)}")
 
 
+def _soft(E, t, T):
+    L = 100.0 * np.concatenate([(E @ t)[:, None], E @ T.T], 1)
+    L -= L.max(1, keepdims=True)
+    P = np.exp(L)
+    return P[:, 0] / P.sum(1)
 
 try:
     main()
