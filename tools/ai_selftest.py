@@ -71,3 +71,10 @@ def main():
               f"ta sama rasa śr {same.mean():.3f}; różne rasy śr {diff.mean():.3f} p95 {np.percentile(diff, 95):.3f}")
         wrong = [f"{t}->{n}" for (t, _, _), n in zip(items, top) if exp[t] != n]
         print(f"::notice::{mode} błędy: " + ", ".join(wrong[:20]))
+
+
+try:
+    main()
+except Exception:
+    print("::error::SELFTEST " + traceback.format_exc().replace("\n", "%0A"))
+    raise
