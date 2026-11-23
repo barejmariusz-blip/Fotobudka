@@ -129,7 +129,7 @@ def main():
         p10 = float(np.mean(tags_all[top] == want))
         prec = float(np.mean(tags_all[sel] == want)) if sel.any() else float("nan")
         rec = float(np.sum(tags_all[sel] == want) / max(1, np.sum(tags_all == want)))
-        print(f"::notice::Szukaj „{q}”: trafność top10 {p10:.0%}; wybrane {int(sel.sum())}, z tego trafne {prec:.0%}, znalezione {rec:.0%} z {want}")
+        print(f"::warning::Szukaj „{q}”: trafność top10 {p10:.0%}; wybrane {int(sel.sum())}, z tego trafne {prec:.0%}, znalezione {rec:.0%} z {want}")
 
 
 
