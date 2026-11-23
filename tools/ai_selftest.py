@@ -1,6 +1,6 @@
 """Test w GitHub Actions: zdjęcia z Wikipedii (kilka ras), grupowanie i nazwy ras.
 Wyniki jako adnotacje ::notice:: (widoczne w podsumowaniu builda)."""
-import io, json, os, shutil, sys, urllib.parse, urllib.request
+import io, json, os, shutil, sys, urllib.error, urllib.parse, urllib.request
 import numpy as np
 from PIL import Image, ImageOps
 
@@ -19,21 +19,27 @@ def main():
         return json.load(urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=30))
 
     def images(title, n):
-        q = api({"action": "query", "titles": title, "prop": "images", "imlimit": 50})
-        files = [i["title"] for p in q["query"]["pages"].values() for i in p.get("images", [])
-                 if i["title"].lower().endswith((".jpg", ".jpeg"))]
-        out = []
-        for f in files:
-            if len(out) >= n:
+        import time
+        for attempt in range(4):
+            try:
+                q = api({"action": "query", "titles": title, "generator": "images", "gimlimit": 40,
+                         "prop": "imageinfo", "iiprop": "url", "iiurlwidth": 900})
                 break
-            info = api({"action": "query", "titles": f, "prop": "imageinfo", "iiprop": "url", "iiurlwidth": 900})
-            for p in info["query"]["pages"].values():
-                for ii in p.get("imageinfo", []):
-                    try:
-                        b = urllib.request.urlopen(urllib.request.Request(ii["thumburl"], headers=UA), timeout=30).read()
-                        out.append((f, Image.open(io.BytesIO(b)).convert("RGB")))
-                    except Exception as e:
-                        print("skip", f, e)
+            except urllib.error.HTTPError as e:
+                if e.code != 429:
+                    raise
+                time.sleep(10 * (attempt + 1))
+        pages = q.get("query", {}).get("pages", {}).values()
+        urls = [ii["thumburl"] for p in pages if p["title"].lower().endswith((".jpg", ".jpeg"))
+                for ii in p.get("imageinfo", []) if ii.get("thumburl")]
+        out = []
+        for u in urls[:n]:
+            try:
+                time.sleep(1)
+                b = urllib.request.urlopen(urllib.request.Request(u, headers=UA), timeout=30).read()
+                out.append((u.rsplit("/", 1)[-1], Image.open(io.BytesIO(b)).convert("RGB")))
+            except Exception as e:
+                print("skip", u, e)
         return out
 
     SETS = {"Dalmatian": "Dalmatian dog", "Husky": "Siberian Husky", "BritishSH": "British Shorthair",
