@@ -1,10 +1,14 @@
-"""Rozpoznawanie zwierząt (AI): model CLIP ViT-B/32 (ONNX, ok. 90 MB, pobierany raz).
+"""Rozpoznawanie zwierząt (AI) - wszystko liczone lokalnie, modele pobierane jeden raz.
 
-* Embedding liczony z wycinka kadru wokół obiektu w ostrości (zwierzę + osoba obok),
-  więc tło studia / pleneru ma mniejszy wpływ.
-* Grupowanie: podobieństwo kosinusowe embeddingów (to samo zwierzę / ta sama osoba).
-* Nazwa grupy: rasa / gatunek rozpoznany „zero-shot” (porównanie z opisami tekstowymi
-  przeliczonymi przy budowaniu programu - data/labels.npz).
+Modele (ONNX, razem ok. 200 MB, w %LOCALAPPDATA%/PanRodla/Fotobudka/models):
+  * YOLOv8n  - wykrywa zwierzę (pies, kot, koń, ptak...) i osobę w kadrze,
+  * DINOv2-small - „odcisk wyglądu” konkretnego zwierzęcia / osoby (umaszczenie, łatki, sylwetka, włosy),
+  * CLIP ViT-B/32 - nazwa rasy / gatunku (podpowiedź do nazwy grupy).
+
+Grupowanie:
+  1. zdjęcia łączone wg wyglądu ZWIERZĘCIA (DINOv2 na wycinku zwierzęcia), łączenie średnie (average linkage),
+  2. zdjęcia w tej samej serii zdjęć dostają to samo zwierzę (głosowanie) - poprawia pojedyncze pomyłki,
+  3. grupy zwierząt z tą samą OSOBĄ (DINOv2 na wycinku osoby) łączone w „właściciela”.
 """
 from __future__ import annotations
 
@@ -21,21 +25,26 @@ from PIL import Image
 from . import analysis
 
 try:
-    from ._model import MODEL_URL, MODEL_SHA256, MODEL_SIZE
+    from ._model import MODELS
 except ImportError:  # wersja deweloperska
-    MODEL_URL = ("https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/main/"
-                 "onnx/vision_model_quantized.onnx")
-    MODEL_SHA256 = None
-    MODEL_SIZE = 0
+    MODELS = {}
 
-MEAN = np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
-STD = np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)
+AI_VERSION = 2
+CLIP_MEAN = np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
+CLIP_STD = np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)
+IMNET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+IMNET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+# klasy COCO
+PERSON = 0
+ANIMALS = {14: "ptak", 15: "kot", 16: "pies", 17: "koń", 18: "owca", 19: "krowa", 21: "niedźwiedź"}
 
 _lock = threading.Lock()
-_session = None
+_sessions: dict = {}
 _labels = None
 
 
+# --------------------------------------------------------------------------- pliki modeli
 def data_dir() -> str:
     base = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), ".local", "share")
     d = os.path.join(base, "PanRodla", "Fotobudka", "models")
@@ -43,8 +52,8 @@ def data_dir() -> str:
     return d
 
 
-def model_path() -> str:
-    return os.path.join(data_dir(), "clip-vit-b32-vision-q.onnx")
+def model_path(key: str) -> str:
+    return os.path.join(data_dir(), MODELS[key]["file"] if key in MODELS else f"{key}.onnx")
 
 
 def available() -> bool:
@@ -52,60 +61,76 @@ def available() -> bool:
         import onnxruntime  # noqa: F401
     except ImportError:
         return False
-    return True
+    return bool(MODELS)
+
+
+def missing() -> list[str]:
+    out = []
+    for k, m in MODELS.items():
+        p = model_path(k)
+        if not (os.path.exists(p) and os.path.getsize(p) == m["size"]):
+            out.append(k)
+    return out
 
 
 def model_ready() -> bool:
-    p = model_path()
-    return os.path.exists(p) and (not MODEL_SIZE or os.path.getsize(p) == MODEL_SIZE)
+    return available() and not missing()
 
 
-def download_model(progress=None, cancelled=lambda: False) -> None:
-    """Pobiera model do %LOCALAPPDATA%; sprawdza rozmiar i SHA-256."""
-    dst = model_path()
-    tmp = dst + ".part"
-    req = urllib.request.Request(MODEL_URL, headers={"User-Agent": "Fotobudka (PanRodla)"})
-    h = hashlib.sha256()
-    with urllib.request.urlopen(req, timeout=60) as r, open(tmp, "wb") as f:
-        total = int(r.headers.get("Content-Length") or MODEL_SIZE or 0)
-        done = 0
-        while True:
-            if cancelled():
-                raise RuntimeError("Przerwano")
-            chunk = r.read(1 << 20)
-            if not chunk:
-                break
-            f.write(chunk)
-            h.update(chunk)
-            done += len(chunk)
-            if progress:
-                progress(done, total)
-    if MODEL_SHA256 and h.hexdigest() != MODEL_SHA256:
-        os.remove(tmp)
-        raise RuntimeError("Pobrany model jest uszkodzony (zła suma kontrolna) - spróbuj ponownie.")
-    os.replace(tmp, dst)
+def download_size() -> int:
+    return sum(MODELS[k]["size"] for k in missing())
+
+
+def download_models(progress=None, cancelled=lambda: False) -> None:
+    keys = missing()
+    total = sum(MODELS[k]["size"] for k in keys)
+    done = 0
+    for k in keys:
+        m = MODELS[k]
+        dst = model_path(k)
+        tmp = dst + ".part"
+        h = hashlib.sha256()
+        req = urllib.request.Request(m["url"], headers={"User-Agent": "Fotobudka (PanRodla)"})
+        with urllib.request.urlopen(req, timeout=60) as r, open(tmp, "wb") as f:
+            while True:
+                if cancelled():
+                    raise RuntimeError("Przerwano")
+                chunk = r.read(1 << 20)
+                if not chunk:
+                    break
+                f.write(chunk)
+                h.update(chunk)
+                done += len(chunk)
+                if progress:
+                    progress(done, total)
+        if h.hexdigest() != m["sha256"]:
+            os.remove(tmp)
+            raise RuntimeError(f"Pobrany model {k} jest uszkodzony (zła suma kontrolna) - spróbuj ponownie.")
+        os.replace(tmp, dst)
 
 
 def _resource(rel: str) -> str:
-    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-    p = os.path.join(base, "fotobudka", rel)
-    return p if os.path.exists(p) else os.path.join(os.path.dirname(os.path.abspath(__file__)), rel)
+    base = getattr(sys, "_MEIPASS", None)
+    if base:
+        p = os.path.join(base, "fotobudka", rel)
+        if os.path.exists(p):
+            return p
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), rel)
 
 
-def session():
-    global _session
+def session(key: str):
     with _lock:
-        if _session is None:
+        if key not in _sessions:
             import onnxruntime as ort
             so = ort.SessionOptions()
             so.intra_op_num_threads = 2
             so.inter_op_num_threads = 1
-            _session = ort.InferenceSession(model_path(), so, providers=["CPUExecutionProvider"])
-        return _session
+            _sessions[key] = ort.InferenceSession(model_path(key), so, providers=["CPUExecutionProvider"])
+        return _sessions[key]
 
 
 def labels():
-    """(nazwy_pl, macierz embeddingów tekstu [N,512]) albo (None, None)."""
+    """(nazwy_pl, embeddingi tekstu CLIP [N,512]) albo (None, None)."""
     global _labels
     if _labels is None:
         p = _resource(os.path.join("data", "labels.npz"))
@@ -117,169 +142,252 @@ def labels():
     return _labels
 
 
-# --------------------------------------------------------------------------- obraz -> embedding
-def subject_crop(img: Image.Image, tiles: np.ndarray | None, expand: float = 0.35) -> Image.Image:
-    """Kwadratowy wycinek wokół najostrzejszych kafelków (obiekt w ostrości)."""
+# --------------------------------------------------------------------------- detekcja (YOLOv8)
+def detect(img: Image.Image, conf: float = 0.30) -> list[tuple[int, float, tuple[float, float, float, float]]]:
+    """Zwraca [(klasa, pewność, (x0, y0, x1, y1))] we współrzędnych obrazu."""
+    sess = session("yolo")
+    size = 640
     w, h = img.size
-    if tiles is None:
-        side = min(w, h)
-        return img.crop(((w - side) // 2, (h - side) // 2, (w + side) // 2, (h + side) // 2))
-    g = tiles.shape[0]
-    sel = tiles >= np.quantile(tiles, 0.88)
-    ys, xs = np.nonzero(sel)
-    x0, x1 = xs.min() / g * w, (xs.max() + 1) / g * w
-    y0, y1 = ys.min() / g * h, (ys.max() + 1) / g * h
+    s = size / max(w, h)
+    nw, nh = int(round(w * s)), int(round(h * s))
+    canvas = Image.new("RGB", (size, size), (114, 114, 114))
+    px, py = (size - nw) // 2, (size - nh) // 2
+    canvas.paste(img.convert("RGB").resize((nw, nh), Image.Resampling.BILINEAR), (px, py))
+    x = (np.asarray(canvas, dtype=np.float32) / 255.0).transpose(2, 0, 1)[None]
+    out = sess.run(None, {sess.get_inputs()[0].name: x})[0]
+    out = out.reshape(out.shape[-2], out.shape[-1])                  # [84, 8400]
+    if out.shape[0] > out.shape[1]:
+        out = out.T
+    boxes, scores = out[:4].T, out[4:].T
+    cls = scores.argmax(1)
+    sc = scores[np.arange(len(cls)), cls]
+    keep = sc >= conf
+    boxes, cls, sc = boxes[keep], cls[keep], sc[keep]
+    res = []
+    for c in np.unique(cls):
+        if c != PERSON and c not in ANIMALS:
+            continue
+        m = cls == c
+        b, s_ = boxes[m], sc[m]
+        xyxy = np.stack([b[:, 0] - b[:, 2] / 2, b[:, 1] - b[:, 3] / 2,
+                         b[:, 0] + b[:, 2] / 2, b[:, 1] + b[:, 3] / 2], 1)
+        for i in _nms(xyxy, s_, 0.5):
+            x0, y0, x1, y1 = xyxy[i]
+            res.append((int(c), float(s_[i]),
+                        ((x0 - px) / s, (y0 - py) / s, (x1 - px) / s, (y1 - py) / s)))
+    return res
+
+
+def _nms(b, s, thr):
+    order = np.argsort(-s)
+    keep = []
+    area = (b[:, 2] - b[:, 0]) * (b[:, 3] - b[:, 1])
+    while len(order):
+        i = order[0]
+        keep.append(i)
+        rest = order[1:]
+        if not len(rest):
+            break
+        xx0 = np.maximum(b[i, 0], b[rest, 0])
+        yy0 = np.maximum(b[i, 1], b[rest, 1])
+        xx1 = np.minimum(b[i, 2], b[rest, 2])
+        yy1 = np.minimum(b[i, 3], b[rest, 3])
+        inter = np.clip(xx1 - xx0, 0, None) * np.clip(yy1 - yy0, 0, None)
+        iou = inter / (area[i] + area[rest] - inter + 1e-9)
+        order = rest[iou < thr]
+    return keep
+
+
+def square_crop(img: Image.Image, box, pad: float = 0.10) -> Image.Image:
+    w, h = img.size
+    x0, y0, x1, y1 = box
     cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
-    side = max(x1 - x0, y1 - y0) * (1 + expand)
-    side = min(max(side, min(w, h) * 0.45), min(w, h))
-    left = min(max(0, cx - side / 2), w - side)
-    top = min(max(0, cy - side / 2), h - side)
-    return img.crop((int(left), int(top), int(left + side), int(top + side)))
+    side = max(x1 - x0, y1 - y0) * (1 + 2 * pad)
+    side = max(16.0, min(side, max(w, h)))
+    left, top = cx - side / 2, cy - side / 2
+    canvas = Image.new("RGB", (int(side), int(side)), (0, 0, 0))
+    src = img.crop((int(max(0, left)), int(max(0, top)), int(min(w, left + side)), int(min(h, top + side))))
+    canvas.paste(src, (int(max(0, -left)), int(max(0, -top))))
+    return canvas
 
 
-def preprocess(img: Image.Image) -> np.ndarray:
+# --------------------------------------------------------------------------- embeddingi
+def _prep(img: Image.Image, mean, std) -> np.ndarray:
     im = img.convert("RGB").resize((224, 224), Image.Resampling.BICUBIC)
-    a = (np.asarray(im, dtype=np.float32) / 255.0 - MEAN) / STD
+    a = (np.asarray(im, dtype=np.float32) / 255.0 - mean) / std
     return a.transpose(2, 0, 1)[None]
 
 
-def embed_image(img: Image.Image) -> np.ndarray:
-    sess = session()
-    inp = sess.get_inputs()[0].name
+def _norm(v: np.ndarray) -> np.ndarray:
+    v = np.asarray(v, dtype=np.float32).reshape(-1)
+    return v / max(float(np.linalg.norm(v)), 1e-9)
+
+
+def dino(img: Image.Image) -> np.ndarray:
+    sess = session("dino")
+    outs = [o.name for o in sess.get_outputs()]
+    r = sess.run(None, {sess.get_inputs()[0].name: _prep(img, IMNET_MEAN, IMNET_STD)})
+    d = dict(zip(outs, r))
+    if "last_hidden_state" in d:
+        hs = d["last_hidden_state"][0]
+        v = np.concatenate([_norm(hs[0]), _norm(hs[1:].mean(0))])   # CLS + średnia z łatek
+    else:
+        v = r[0]
+    return _norm(v)
+
+
+def clip(img: Image.Image) -> np.ndarray:
+    sess = session("clip")
     outs = [o.name for o in sess.get_outputs()]
     name = "image_embeds" if "image_embeds" in outs else outs[0]
-    v = sess.run([name], {inp: preprocess(img)})[0].reshape(-1).astype(np.float32)
-    return v / max(float(np.linalg.norm(v)), 1e-9)
+    return _norm(sess.run([name], {sess.get_inputs()[0].name: _prep(img, CLIP_MEAN, CLIP_STD)})[0])
 
 
-def embed_photo(data: bytes, orientation: int, mode: str = "mix") -> np.ndarray:
-    """mode: crop (obiekt w ostrości), full (cały kadr wyśrodkowany), mix (średnia obu)."""
-    im = analysis.open_jpeg(data, 1024, orientation)
-    if mode == "full":
-        return embed_image(subject_crop(im, None))
-    _, tiles = analysis.sharpness_score(im, return_tiles=True)
-    c = embed_image(subject_crop(im, tiles))
-    if mode == "crop":
-        return c
-    v = c + embed_image(subject_crop(im, None))
-    return v / max(float(np.linalg.norm(v)), 1e-9)
+def analyze_image(im: Image.Image) -> dict:
+    """{"a": emb zwierzęcia | None, "p": emb osoby | None, "c": emb CLIP zwierzęcia | None, "k": gatunek}"""
+    dets = detect(im)
+    W, H = im.size
+    animals = [d for d in dets if d[0] in ANIMALS]
+    persons = [d for d in dets if d[0] == PERSON]
 
+    def score(d):
+        x0, y0, x1, y1 = d[2]
+        return d[1] * ((x1 - x0) * (y1 - y0)) / (W * H)
 
-def to_b64(v: np.ndarray) -> str:
-    return base64.b64encode(v.astype(np.float16).tobytes()).decode("ascii")
-
-
-def from_b64(s: str) -> np.ndarray:
-    v = np.frombuffer(base64.b64decode(s), dtype=np.float16).astype(np.float32)
-    return v / max(float(np.linalg.norm(v)), 1e-9)
-
-
-# --------------------------------------------------------------------------- grupowanie
-def cluster(embs: list[np.ndarray | None], threshold: float = 0.86, k: int = 0) -> list[int]:
-    """Grupy zdjęć tego samego zwierzęcia/osoby. Zwraca etykiety 0.. (największa = 0), -1 brak.
-
-    k = 0: automatycznie wg progu podobieństwa (lider + łączenie podobnych grup + doprecyzowanie).
-    k > 0: dokładnie k grup (k-means na sferze).
-    """
-    idx = [i for i, e in enumerate(embs) if e is not None]
-    out = [-1] * len(embs)
-    if not idx:
-        return out
-    X = np.stack([embs[i] for i in idx])
-    if k > 0:
-        lab = _spherical_kmeans(X, min(k, len(idx)))
-    else:
-        C: list[np.ndarray] = []
-        S: list[np.ndarray] = []
-        cnt: list[int] = []
-        lab = np.zeros(len(X), dtype=int)
-        for j, x in enumerate(X):
-            if C:
-                sims = np.stack(C) @ x
-                b = int(np.argmax(sims))
-                if sims[b] >= threshold:
-                    lab[j] = b
-                    S[b] = S[b] + x
-                    cnt[b] += 1
-                    C[b] = S[b] / np.linalg.norm(S[b])
-                    continue
-            lab[j] = len(C)
-            C.append(x.copy())
-            S.append(x.copy())
-            cnt.append(1)
-        # łączenie grup o podobnych środkach
-        merged = True
-        while merged and len(C) > 1:
-            merged = False
-            M = np.stack(C) @ np.stack(C).T
-            np.fill_diagonal(M, -1)
-            a, b = np.unravel_index(np.argmax(M), M.shape)
-            if M[a, b] >= threshold:
-                a, b = min(a, b), max(a, b)
-                lab[lab == b] = a
-                lab[lab > b] -= 1
-                S[a] = S[a] + S[b]
-                C[a] = S[a] / np.linalg.norm(S[a])
-                cnt[a] += cnt[b]
-                del C[b], S[b], cnt[b]
-                merged = True
-        # doprecyzowanie: każde zdjęcie do najbliższego środka
-        Cm = np.stack(C)
-        for _ in range(3):
-            lab = np.argmax(X @ Cm.T, axis=1)
-            Cm = np.stack([X[lab == c].mean(0) if (lab == c).any() else Cm[c] for c in range(len(Cm))])
-            Cm /= np.linalg.norm(Cm, axis=1, keepdims=True)
-        # małe grupy (1-2 zdjęcia) dołącz do najbliższej, jeśli w miarę podobne
-        sizes = np.bincount(lab, minlength=len(Cm))
-        for c in np.where(sizes < 3)[0]:
-            if len(Cm) < 2:
-                break
-            sims = Cm @ Cm[c]
-            sims[c] = -1
-            sims[sizes < 3] = -1
-            b = int(np.argmax(sims))
-            if sims[b] >= threshold - 0.06:
-                lab[lab == c] = b
-    order = [c for c, _ in sorted(((c, int((lab == c).sum())) for c in set(lab.tolist())), key=lambda t: -t[1])]
-    remap = {c: i for i, c in enumerate(order)}
-    for j, i in enumerate(idx):
-        out[i] = remap[int(lab[j])]
+    out = {"a": None, "p": None, "c": None, "k": None}
+    if animals:
+        a = max(animals, key=score)
+        crop = square_crop(im, a[2], 0.08)
+        out["a"] = dino(crop)
+        out["c"] = clip(crop)
+        out["k"] = ANIMALS[a[0]]
+    if persons:
+        p = max(persons, key=score)
+        x0, y0, x1, y1 = p[2]
+        top = (x0, y0, x1, y0 + (y1 - y0) * 0.6)    # głowa, włosy i tułów
+        out["p"] = dino(square_crop(im, top, 0.05))
     return out
 
 
-def _spherical_kmeans(X: np.ndarray, k: int, iters: int = 30) -> np.ndarray:
-    rng = np.random.default_rng(0)
-    C = [X[rng.integers(len(X))]]
-    for _ in range(1, k):
-        d = 1 - np.max(X @ np.stack(C).T, axis=1)
-        d = np.clip(d, 0, None) ** 2
-        C.append(X[rng.choice(len(X), p=d / d.sum())] if d.sum() > 0 else X[rng.integers(len(X))])
-    C = np.stack(C)
-    lab = np.zeros(len(X), dtype=int)
-    for _ in range(iters):
-        new = np.argmax(X @ C.T, axis=1)
-        if _ and (new == lab).all():
+def analyze_photo(data: bytes, orientation: int) -> dict:
+    return analyze_image(analysis.open_jpeg(data, 1280, orientation))
+
+
+def to_b64(v: np.ndarray) -> str:
+    return base64.b64encode(np.asarray(v, dtype=np.float16).tobytes()).decode("ascii")
+
+
+def from_b64(s: str) -> np.ndarray:
+    return _norm(np.frombuffer(base64.b64decode(s), dtype=np.float16).astype(np.float32))
+
+
+# --------------------------------------------------------------------------- grupowanie
+def agglomerate(X: np.ndarray, threshold: float, k: int = 0) -> np.ndarray:
+    """Średnie łączenie (average linkage) dla podobieństwa kosinusowego.
+
+    Średnie podobieństwo dwóch grup = (suma_A · suma_B) / (|A|·|B|) - liczone z sum wektorów
+    (dla wektorów jednostkowych to dokładnie średnia podobieństw wszystkich par).
+    Najpierw szybkie mikro-grupy (prawie identyczne kadry), potem pełne łączenie.
+    k > 0: łączenie aż zostanie k grup; inaczej do progu.
+    """
+    n = len(X)
+    if n == 0:
+        return np.zeros(0, dtype=int)
+    micro = np.full(n, -1)
+    reps: list[int] = []
+    tight = min(0.97, max(threshold + 0.15, 0.90))
+    for i in range(n):
+        if reps:
+            sims = X[reps] @ X[i]
+            j = int(np.argmax(sims))
+            if sims[j] >= tight:
+                micro[i] = micro[reps[j]]
+                continue
+        micro[i] = len(reps)
+        reps.append(i)
+    m = len(reps)
+    S = np.zeros((m, X.shape[1]), dtype=np.float64)
+    cnt = np.zeros(m)
+    for i in range(n):
+        S[micro[i]] += X[i]
+        cnt[micro[i]] += 1
+    alive = list(range(m))
+    owner = np.arange(m)
+    target = k if k > 0 else 1
+    while len(alive) > target:
+        A = S[alive]
+        D = (A @ A.T) / np.outer(cnt[alive], cnt[alive])
+        np.fill_diagonal(D, -np.inf)
+        a, b = np.unravel_index(np.argmax(D), D.shape)
+        if k <= 0 and D[a, b] < threshold:
             break
-        lab = new
-        for c in range(k):
-            if (lab == c).any():
-                m = X[lab == c].mean(0)
-                C[c] = m / np.linalg.norm(m)
-    return lab
+        ia, ib = alive[a], alive[b]
+        S[ia] += S[ib]
+        cnt[ia] += cnt[ib]
+        owner[owner == ib] = ia
+        alive.pop(int(b))
+    pos = {c: j for j, c in enumerate(alive)}
+    return np.array([pos[owner[micro[i]]] for i in range(n)])
+
+
+def cluster(photos: list[dict | None], series: list[int], threshold: float, k: int = 0,
+            person_threshold: float = 0.75) -> tuple[list[int], list[int]]:
+    """photos[i] = wynik analyze_photo (embeddingi numpy) albo None.
+
+    Zwraca (zwierzę dla każdego zdjęcia [-1 = nie rozpoznano], właściciel dla każdej grupy zwierząt).
+    """
+    n = len(photos)
+    idx = [i for i in range(n) if photos[i] and photos[i].get("a") is not None]
+    lab = [-1] * n
+    if idx:
+        X = np.stack([photos[i]["a"] for i in idx])
+        g = agglomerate(X, threshold, k)
+        for j, i in enumerate(idx):
+            lab[i] = int(g[j])
+    # głosowanie w seriach: zdjęcia z jednej serii to zwykle to samo zwierzę
+    by_series: dict[int, list[int]] = {}
+    for i, s in enumerate(series):
+        by_series.setdefault(s, []).append(i)
+    for members in by_series.values():
+        votes = [lab[i] for i in members if lab[i] >= 0]
+        if not votes:
+            continue
+        best = max(set(votes), key=votes.count)
+        if votes.count(best) >= 0.6 * len(votes):
+            for i in members:
+                lab[i] = best
+    used = sorted({x for x in lab if x >= 0}, key=lambda c: -lab.count(c))
+    remap = {c: j for j, c in enumerate(used)}
+    lab = [remap.get(x, -1) for x in lab]
+    na = len(used)
+    # właściciel: grupy zwierząt z tą samą osobą na zdjęciach
+    pc = []
+    for c in range(na):
+        ps = [photos[i]["p"] for i in range(n) if lab[i] == c and photos[i] and photos[i].get("p") is not None]
+        pc.append(_norm(np.mean(ps, 0)) if len(ps) >= 3 else None)
+    owners = list(range(na))
+    for a in range(na):
+        for b in range(a + 1, na):
+            if pc[a] is not None and pc[b] is not None and float(pc[a] @ pc[b]) >= person_threshold:
+                oa, ob = owners[a], owners[b]
+                owners = [oa if o == ob else o for o in owners]
+    remap_o = {o: j for j, o in enumerate(dict.fromkeys(owners))}
+    return lab, [remap_o[o] for o in owners]
 
 
 def centroid(embs: list[np.ndarray]) -> np.ndarray:
-    m = np.mean(np.stack(embs), axis=0)
-    return m / max(float(np.linalg.norm(m)), 1e-9)
+    return _norm(np.mean(np.stack(embs), axis=0))
 
 
-def name_for(c: np.ndarray) -> tuple[str | None, float]:
-    """Rasa / gatunek dla środka grupy (zero-shot CLIP)."""
+def name_for(clip_embs: list[np.ndarray]) -> tuple[str | None, float]:
+    """Rasa / gatunek dla grupy - średnia z prawdopodobieństw CLIP na zdjęciach grupy."""
     names, emb = labels()
-    if names is None:
+    if names is None or not clip_embs:
         return None, 0.0
-    logits = 100.0 * (emb @ c)
-    p = np.exp(logits - logits.max())
-    p /= p.sum()
-    i = int(np.argmax(p))
-    return names[i], float(p[i])
+    E = np.stack(clip_embs)
+    logits = 100.0 * (E @ emb.T)
+    p = np.exp(logits - logits.max(1, keepdims=True))
+    p /= p.sum(1, keepdims=True)
+    mean = p.mean(0)
+    i = int(np.argmax(mean))
+    return names[i], float(mean[i])

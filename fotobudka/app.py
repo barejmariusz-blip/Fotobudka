@@ -74,7 +74,7 @@ class Photo:
     csig: list | None = None             # histogram kolorów obiektu
     cmean: list | None = None            # średni kolor obiektu RGB
     animal: int = -1                     # grupa (zwierzę)
-    emb: object = None                   # embedding AI (numpy) albo None
+    ai: dict | None = None               # wynik AI: a (zwierzę), p (osoba), c (CLIP), k (gatunek)
 
 
 # =========================================================================== miniatury
@@ -578,7 +578,8 @@ class MainWindow(QMainWindow):
         self.ai_left = 0
         self.ai_total = 0
         self.ai_running = False
-        self.animal_names: list[dict] = []   # [{"v": b64 środek grupy, "n": nazwa}]
+        self.animal_names: list[dict] = []   # [{"v": b64 środek grupy, "n": nazwa, "t": a/o}]
+        self.owners: list[dict] = []
 
         self.save_timer = QTimer(self, singleShot=True, interval=1200, timeout=self._save_now)
         self.suggest_timer = QTimer(self, singleShot=True, interval=600, timeout=self._recompute)
@@ -970,11 +971,12 @@ class MainWindow(QMainWindow):
                     p.ev = tuple(s["ev"]) if s.get("ev") else None
                     p.expo = analysis.exposure_flag(p.ev)
                     p.csig, p.cmean = s.get("c"), s.get("cm")
-            if s.get("e") and p.meta is not None:
+            if isinstance(s.get("ai"), dict) and s["ai"].get("v") == ai.AI_VERSION and p.meta is not None:
                 try:
-                    p.emb = ai.from_b64(s["e"])
+                    p.ai = {k: (ai.from_b64(s["ai"][k]) if s["ai"].get(k) else None) for k in ("a", "p", "c")}
+                    p.ai["k"] = s["ai"].get("k")
                 except Exception:
-                    p.emb = None
+                    p.ai = None
             self.photos.append(p)
             if p.meta is None:
                 need_meta.append(len(self.photos) - 1)
@@ -1133,32 +1135,43 @@ class MainWindow(QMainWindow):
             self.preview_lbl.setText("")
 
     def _animal_labels(self, k: int) -> list[int]:
-        key = (k, len(self.photos), sum(1 for p in self.photos if p.csig), sum(1 for p in self.photos if p.emb is not None),
-               tuple(p.name for p in self.photos[:3]))
+        key = (k, len(self.photos), sum(1 for p in self.photos if p.csig), sum(1 for p in self.photos if p.ai),
+               tuple(p.name for p in self.photos[:3]), self.applied_mode)
         if key not in self._ak_cache:
             self._ak_cache = {kk: v for kk, v in self._ak_cache.items() if kk[1:] == key[1:]}
             if self._ai_mode():
-                self._ak_cache[key] = ai.cluster([p.emb for p in self.photos], self.AI_THRESHOLD, k)
+                lab, owners = ai.cluster([p.ai for p in self.photos], [p.group for p in self.photos],
+                                         self.AI_THRESHOLD, k)
+                self._ak_cache[key] = (lab, owners)
             else:
-                self._ak_cache[key] = analysis.animal_clusters([p.csig for p in self.photos], k)
-        return self._ak_cache[key]
+                self._ak_cache[key] = (analysis.animal_clusters([p.csig for p in self.photos], k), None)
+        return self._ak_cache[key][0]
 
-    AI_THRESHOLD = 0.86
+    AI_THRESHOLD = 0.55
 
     def _ai_mode(self) -> bool:
-        return bool(self.photos) and all(p.emb is not None or p.failed for p in self.photos) \
-            and any(p.emb is not None for p in self.photos)
+        return bool(self.photos) and all(p.ai is not None or p.failed for p in self.photos) \
+            and any(p.ai is not None for p in self.photos)
 
     def _cluster_animals(self):
         self.applied_k = self.k_spin.value()
         if not self.photos or any(p.csig is None and not p.failed for p in self.photos):
             return
         labels = self._animal_labels(self.applied_k)
+        key = next(k for k, v in self._ak_cache.items() if v[0] is labels)
+        owners = self._ak_cache[key][1]
         self.animals = []
+        self.owners = []
         for i, p in enumerate(self.photos):
             p.animal = labels[i]
         aim = self._ai_mode()
-        stored = [(ai.from_b64(n["v"]), n["n"]) for n in self.animal_names]
+        stored = [(ai.from_b64(n["v"]), n["n"], n.get("t", "a")) for n in self.animal_names]
+
+        def named(cen, kind):
+            cands = [(float(v @ cen), nm) for v, nm, t in stored if t == kind and v.shape == cen.shape]
+            best = max(cands, default=None)
+            return best[1] if best and best[0] >= (0.80 if kind == "a" else 0.85) else None
+
         for c in sorted(set(x for x in labels if x >= 0)):
             members = [p for p in self.photos if p.animal == c]
             ms = [p.cmean for p in members if p.cmean]
@@ -1166,15 +1179,32 @@ class MainWindow(QMainWindow):
             a = {"rgb": rgb, "hex": "#%02x%02x%02x" % tuple(int(v) for v in rgb), "n": len(members),
                  "name": analysis.color_name(rgb), "centroid": None, "custom": False}
             if aim:
-                cen = ai.centroid([p.emb for p in members if p.emb is not None])
-                a["centroid"] = cen
-                best = max(stored, key=lambda t: float(t[0] @ cen), default=None)
-                if best is not None and float(best[0] @ cen) >= 0.90:
-                    a["name"], a["custom"] = best[1], True
+                emb = [p.ai["a"] for p in members if p.ai and p.ai.get("a") is not None]
+                a["centroid"] = ai.centroid(emb) if emb else None
+                pe = [p.ai["p"] for p in members if p.ai and p.ai.get("p") is not None]
+                a["person"] = ai.centroid(pe) if len(pe) >= 3 else None
+                nm = named(a["centroid"], "a") if a["centroid"] is not None else None
+                if nm:
+                    a["name"], a["custom"] = nm, True
                 else:
-                    nm, prob = ai.name_for(cen)
-                    a["name"] = nm if nm and prob >= 0.20 else f"zwierzę {c + 1}"
+                    kinds = [p.ai.get("k") for p in members if p.ai and p.ai.get("k")]
+                    kind = max(set(kinds), key=kinds.count) if kinds else "zwierzę"
+                    br, prob = ai.name_for([p.ai["c"] for p in members if p.ai and p.ai.get("c") is not None])
+                    a["name"] = f"{br}?" if br and prob >= 0.25 else kind
+                    if sum(1 for x in self.animals if x["name"].rstrip("?") == a["name"].rstrip("?")):
+                        a["name"] += f" {sum(1 for x in self.animals if x['name'].startswith(a['name'].rstrip('?'))) + 1}"
             self.animals.append(a)
+        if aim and owners:
+            for o in sorted(set(owners)):
+                ids = [i for i, x in enumerate(owners) if x == o]
+                if len(ids) < 2:
+                    continue
+                pcs = [self.animals[i]["person"] for i in ids if self.animals[i].get("person") is not None]
+                cen = ai.centroid(pcs) if pcs else None
+                nm = named(cen, "o") if cen is not None else None
+                self.owners.append({"animals": ids, "centroid": cen, "custom": bool(nm),
+                                    "name": nm or f"osoba {len(self.owners) + 1}",
+                                    "n": sum(self.animals[i]["n"] for i in ids)})
         self._fill_animal_box()
 
     # ------------------------------------------------------------------ AI
@@ -1188,7 +1218,7 @@ class MainWindow(QMainWindow):
         elif not ai.model_ready():
             self.ai_btn.setText("🐾 Włącz AI")
             self.ai_btn.setEnabled(True)
-            self.ai_btn.setToolTip("Rozpoznawanie zwierząt i ras przez AI (model ok. 90 MB pobierany jeden raz).\n"
+            self.ai_btn.setToolTip(f"Rozpoznawanie zwierząt i osób przez AI (modele ok. {ai.download_size() // 1048576} MB, pobierane raz).\n"
                                    "Bez AI zdjęcia są grupowane tylko po kolorach.")
         else:
             self.ai_btn.setText("🐾 AI ✔" if self._ai_mode() else "🐾 Uruchom AI")
@@ -1204,7 +1234,7 @@ class MainWindow(QMainWindow):
 
     def download_ai(self):
         if QMessageBox.question(self, APP_NAME,
-                                "Pobrać model AI do rozpoznawania zwierząt (ok. 90 MB)?\n\n"
+                                f"Pobrać modele AI do rozpoznawania zwierząt (ok. {ai.download_size() // 1048576} MB)?\n\n"
                                 "Pobiera się jeden raz, potem działa bez internetu.\n"
                                 "Zdjęcia nigdzie nie są wysyłane – wszystko liczy się na tym komputerze.") \
                 != QMessageBox.StandardButton.Yes:
@@ -1235,7 +1265,7 @@ class MainWindow(QMainWindow):
     def start_ai(self):
         if self.ai_running or not self.photos or self.analysis_running:
             return
-        todo = [i for i, p in enumerate(self.photos) if p.emb is None and not p.failed and p.meta]
+        todo = [i for i, p in enumerate(self.photos) if p.ai is None and not p.failed and p.meta]
         if not todo:
             self._cluster_animals()
             self.apply_filter()
@@ -1250,11 +1280,10 @@ class MainWindow(QMainWindow):
             p = self.photos[i]
             self.pool.start(AITask(self.sig, self.gen, i, p.path, p.meta))
 
-    def _on_ai(self, gen, idx, emb):
+    def _on_ai(self, gen, idx, res):
         if gen != self.gen or not self.ai_running:
             return
-        if emb is not None:
-            self.photos[idx].emb = emb
+        self.photos[idx].ai = res if res is not None else {"a": None, "p": None, "c": None, "k": None}
         self.ai_left -= 1
         self._progress(self.ai_total - self.ai_left, self.ai_total,
                        "Etap 3/3 – rozpoznawanie zwierząt (AI)", eta_from=self.ai_t0)
@@ -1267,10 +1296,14 @@ class MainWindow(QMainWindow):
             self._update_ai_btn()
             self.progress.setVisible(False)
             if len(self.animals) > 0:
-                txt = ("🐾 <b>Rozpoznawanie zwierząt zakończone</b> — " +
-                       ", ".join(f"<span style='color:{a['hex']}'>●</span> <b>{a['name']}</b> ({a['n']})"
-                                 for a in self.animals) +
-                       "<br>Wybierz zwierzę z listy „Zwierzę”. ✎ nadaje grupie własną nazwę (np. imię klientki).")
+                unk = sum(1 for p in self.photos if p.animal < 0)
+                txt = (f"🐾 <b>Rozpoznawanie zakończone</b> — {len(self.animals)} zwierząt"
+                       + (f", {len(self.owners)} osób z kilkoma zwierzętami" if self.owners else "") + ": "
+                       + ", ".join(f"<span style='color:{a['hex']}'>●</span> <b>{a['name']}</b> ({a['n']})"
+                                   for a in self.animals[:8])
+                       + (f"<br>❔ {unk} zdjęć bez rozpoznanego zwierzęcia" if unk else "")
+                       + "<br>Wybierz z listy „Zwierzę”. ✎ nadaje własną nazwę (zwierzęciu albo osobie) – zapamiętuję ją."
+                       + " „?” przy rasie = przypuszczenie AI.")
                 self.banner_lbl.setText(txt)
                 self.banner_apply.setVisible(False)
                 self.banner.setStyleSheet("background:#1f2f3d; color:#e6e6e6;")
@@ -1279,36 +1312,61 @@ class MainWindow(QMainWindow):
     def rename_animal(self):
         c = self.animal_box.currentData()
         if c is None or c < 0:
-            QMessageBox.information(self, APP_NAME, "Najpierw wybierz grupę z listy „Zwierzę”.")
+            QMessageBox.information(self, APP_NAME, "Najpierw wybierz grupę (zwierzę albo osobę) z listy „Zwierzę”.")
             return
-        a = self.animals[c]
-        if a.get("centroid") is None:
+        if c >= 1000:
+            g, kind, hint = self.owners[c - 1000], "o", "Nazwa osoby (np. „Pani Ania”):"
+        else:
+            g, kind, hint = self.animals[c], "a", "Nazwa zwierzęcia (np. „Luna – dalmatyńczyk”):"
+        cen = g.get("centroid")
+        if cen is None:
+            QMessageBox.information(self, APP_NAME, "Tej grupy nie da się zapamiętać (brak danych AI).")
             return
-        name, ok = QInputDialog.getText(self, APP_NAME, "Nazwa grupy (np. „Pani Ania – Luna”):", text=a["name"])
+        name, ok = QInputDialog.getText(self, APP_NAME, hint, text=g["name"].rstrip("?"))
         if not ok or not name.strip():
             return
-        cen = a["centroid"]
-        self.animal_names = [n for n in self.animal_names if float(ai.from_b64(n["v"]) @ cen) < 0.90]
-        self.animal_names.append({"v": ai.to_b64(cen), "n": name.strip()})
-        a["name"], a["custom"] = name.strip(), True
+        self.animal_names = [n for n in self.animal_names
+                             if n.get("t", "a") != kind or float(ai.from_b64(n["v"]) @ cen) < 0.80]
+        self.animal_names.append({"v": ai.to_b64(cen), "n": name.strip(), "t": kind})
+        g["name"], g["custom"] = name.strip(), True
         self._fill_animal_box()
         self._update_info()
         self._save_now()
 
     def _fill_animal_box(self):
+        from PySide6.QtGui import QIcon
         cur = self.animal_box.currentData()
         self.animal_box.blockSignals(True)
         self.animal_box.clear()
         self.animal_box.addItem("wszystkie", -1)
-        if len(self.animals) > 1:
+
+        def icon(hexes):
+            pm = QPixmap(14 * len(hexes), 14)
+            pm.fill(QColor("#00000000"))
+            pt = QPainter(pm)
+            for j, h in enumerate(hexes):
+                pt.fillRect(j * 14, 0, 13, 14, QColor(h))
+            pt.end()
+            return QIcon(pm)
+
+        if len(self.animals) > 1 or self.owners:
+            in_owner = {i for o in self.owners for i in o["animals"]}
+            for oi, o in enumerate(self.owners):
+                names = " + ".join(self.animals[i]["name"].rstrip("?") for i in o["animals"])
+                self.animal_box.addItem(icon([self.animals[i]["hex"] for i in o["animals"]][:3]),
+                                        f"👤 {o['name']}: {names} ({o['n']})", 1000 + oi)
+                for i in o["animals"]:
+                    a = self.animals[i]
+                    self.animal_box.addItem(icon([a["hex"]]), f"     🐾 {a['name']} ({a['n']})", i)
             for i, a in enumerate(self.animals):
-                pm = QPixmap(14, 14)
-                pm.fill(QColor(a["hex"]))
-                from PySide6.QtGui import QIcon
-                self.animal_box.addItem(QIcon(pm), f"{i + 1}: {a['name']} ({a['n']})", i)
+                if i not in in_owner:
+                    self.animal_box.addItem(icon([a["hex"]]), f"🐾 {a['name']} ({a['n']})", i)
+            unk = sum(1 for p in self.photos if p.animal < 0)
+            if unk and self._ai_mode():
+                self.animal_box.addItem(f"❔ nie rozpoznano zwierzęcia ({unk})", -2)
         idx = self.animal_box.findData(cur if cur is not None else -1)
         self.animal_box.setCurrentIndex(max(0, idx))
-        self.animal_box.setEnabled(len(self.animals) > 1)
+        self.animal_box.setEnabled(self.animal_box.count() > 1)
         self.animal_box.blockSignals(False)
         self._update_ai_btn()
 
@@ -1490,8 +1548,16 @@ class MainWindow(QMainWindow):
         pred = FILTERS[self.filter_box.currentIndex()][1]
         ex = self.exif_filter or (lambda p: True)
         an = self.animal_box.currentData() if self.animal_box.currentData() is not None else -1
-        rows = [i for i, p in enumerate(self.photos)
-                if (pred(p) and ex(p) and (an < 0 or p.animal == an)) or i == self.cur]
+        if an >= 1000 and an - 1000 < len(self.owners):
+            aset = set(self.owners[an - 1000]["animals"])
+            am = lambda p: p.animal in aset  # noqa: E731
+        elif an == -2:
+            am = lambda p: p.animal < 0  # noqa: E731
+        elif an >= 0:
+            am = lambda p: p.animal == an  # noqa: E731
+        else:
+            am = lambda p: True  # noqa: E731
+        rows = [i for i, p in enumerate(self.photos) if (pred(p) and ex(p) and am(p)) or i == self.cur]
         self.model.set_rows(rows)
         self._select_current()
         self.viewer.update()
@@ -1732,8 +1798,9 @@ class MainWindow(QMainWindow):
                     d["h"] = p.hash
                 if p.csig:
                     d["c"], d["cm"] = p.csig, p.cmean
-            if p.emb is not None:
-                d["e"] = ai.to_b64(p.emb)
+            if p.ai is not None:
+                d["ai"] = {"v": ai.AI_VERSION, "k": p.ai.get("k"),
+                           **{k: ai.to_b64(p.ai[k]) for k in ("a", "p", "c") if p.ai.get(k) is not None}}
             if p.rating:
                 d["r"] = p.rating
             if p.rejected:

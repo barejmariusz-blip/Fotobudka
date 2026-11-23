@@ -9,10 +9,39 @@ permissions:
   contents: write
 
 jobs:
+  models:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install onnxruntime numpy pillow tokenizers
+      - name: AI assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python tools/build_ai_assets.py
+      - name: AI self-test
+        continue-on-error: true
+        run: python tools/ai_selftest.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ai-assets
+          path: |
+            fotobudka/_model.py
+            fotobudka/data/labels.npz
+
   build:
+    needs: models
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ai-assets
+          path: fotobudka
 
       - uses: actions/setup-python@v5
         with:
@@ -21,18 +50,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt pyinstaller tokenizers
-
-      - name: AI assets (model checksum + breed labels)
-        env:
-          PYTHONUTF8: "1"
-        run: python tools/build_ai_assets.py
-
-      - name: AI self-test
-        continue-on-error: true
-        env:
-          PYTHONUTF8: "1"
-        run: python tools/ai_selftest.py
+          pip install -r requirements.txt pyinstaller
 
       - name: Set version
         shell: bash

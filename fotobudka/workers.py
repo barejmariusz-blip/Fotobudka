@@ -90,13 +90,13 @@ class AITask(QRunnable):
         self.sig, self.gen, self.idx, self.path, self.meta = sig, gen, idx, path, meta
 
     def run(self):
-        emb = None
+        res = None
         try:
             from . import ai
-            emb = ai.embed_photo(raw.read_preview_bytes(self.path, self.meta), self.meta.orientation)
+            res = ai.analyze_photo(raw.read_preview_bytes(self.path, self.meta), self.meta.orientation)
         except Exception:
             traceback.print_exc()
-        self.sig.ai_done.emit(self.gen, self.idx, emb)
+        self.sig.ai_done.emit(self.gen, self.idx, res)
 
 
 class DownloadTask(QRunnable):
@@ -108,7 +108,7 @@ class DownloadTask(QRunnable):
     def run(self):
         try:
             from . import ai
-            ai.download_model(lambda d, t: self.sig.dl_progress.emit(d, t), lambda: self.cancelled)
+            ai.download_models(lambda d, t: self.sig.dl_progress.emit(d, t), lambda: self.cancelled)
             self.sig.dl_done.emit("")
         except Exception as e:
             self.sig.dl_done.emit(str(e) or e.__class__.__name__)
