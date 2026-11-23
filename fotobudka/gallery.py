@@ -154,7 +154,7 @@ def decrypt(key: bytes, blob: bytes) -> bytes:
 def build_files(items: list[tuple[str, object, str]], info: dict, wm: str, progress=None,
                 cancelled=lambda: False) -> tuple[str, str, dict[str, bytes]]:
     """items: [(ścieżka, meta, nazwa wyświetlana)] -> (id, klucz b64u, {ścieżka_w_repo: bajty})."""
-    gid = b64u(secrets.token_bytes(9))
+    gid = "g" + b64u(secrets.token_bytes(9)).replace("-", "x").replace("_", "y")
     key = secrets.token_bytes(32)
     files: dict[str, bytes] = {}
     photos = []
@@ -340,6 +340,7 @@ def publish(settings: dict, items, info: dict, wm: str, progress=None, cancelled
     gid, key, files = build_files(items, info, wm, progress, cancelled)
     files["index.html"] = viewer_html()
     files["robots.txt"] = b"User-agent: *\nDisallow: /\n"
+    files[".nojekyll"] = b""
     gh.commit_files(branch, files, [], f"Galeria {gid}", progress, cancelled)
     warn = ""
     try:

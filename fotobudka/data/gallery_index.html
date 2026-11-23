@@ -109,6 +109,7 @@
   const keyStr = location.hash.slice(1);
   let key, M, sel = new Set(), view = [], showSel = false, cur = -1;
   const thumbs = new Map();   // indeks -> url
+  let errCount = 0;
   const store = "fb-sel-" + gid;
 
   function b64u(s) {
@@ -154,7 +155,10 @@
       io.unobserve(e.target); const i = +e.target.dataset.i, img = e.target.querySelector("img");
       const set = (u) => { img.src = u; img.onload = () => img.classList.add("ok"); };
       if (thumbs.has(i)) set(thumbs.get(i));
-      else imgURL("t", i).then(u => { thumbs.set(i, u); set(u); }).catch(() => {});
+      else imgURL("t", i).then(u => { thumbs.set(i, u); set(u); }).catch((err) => {
+        e.target.querySelector(".no").textContent = `${i + 1} – nie wczytano (${err.message || err})`;
+        errCount++; if (errCount === 1) toast("Nie udało się wczytać części zdjęć – odśwież stronę za chwilę");
+      });
     }
   }, { rootMargin: "600px" });
 
@@ -236,15 +240,15 @@
 
   // ---- start
   (async () => {
-    if (!gid || !keyStr) return fail("Ten link jest niepełny. Poproś o nowy link do galerii.");
+    if (!gid || !keyStr) return fail("To jest strona galerii zdjęć.<br>Aby zobaczyć swoje zdjęcia, otwórz <b>pełny link</b> otrzymany od fotografa.");
     if (!window.crypto || !crypto.subtle) return fail("Ta przeglądarka nie obsługuje galerii. Otwórz link w Chrome lub Safari.");
     try { key = await crypto.subtle.importKey("raw", b64u(keyStr), "AES-GCM", false, ["decrypt"]); }
     catch (e) { return fail("Nieprawidłowy link do galerii."); }
     try { M = JSON.parse(new TextDecoder().decode(await getDec(`g/${gid}/m.bin`))); }
-    catch (e) { return fail("Ta galeria nie istnieje albo została usunięta."); }
+    catch (e) { return fail(`Nie udało się otworzyć galerii (${e.message || e}).<br>Jeśli galeria została właśnie opublikowana, odczekaj 1–2 minuty i odśwież stronę.`); }
     document.title = M.title || "Galeria";
     $("title").textContent = M.title || "Galeria";
-    $("note").textContent = M.note || "";
+    $("note").textContent = (M.note ? M.note + "\n" : "") + `${M.photos.length} zdjęć`;
     $("foot").textContent = M.studio ? `© ${M.studio}` : "";
     load(); updCount(); render();
   })();
