@@ -20,6 +20,7 @@ Szybki program na Windows do przeglądania i odsiewu zdjęć po sesji (stworzony
 | ← → / kółko myszy | poprzednie / następne |
 | 1–5, 0 | ocena / usuń ocenę |
 | X | odrzuć / przywróć |
+| O | przegląd odrzuconych (sprawdzenie, czy automat się nie pomylił) |
 | 6 7 8 9 | etykieta czerwona / żółta / zielona / niebieska |
 | Z / Spacja / klik | zoom 100% (zostaje przy przechodzeniu, wygodne do porównania oczu w serii) |
 | G / Shift+G | następna / poprzednia seria |

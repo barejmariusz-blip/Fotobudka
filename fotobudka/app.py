@@ -24,6 +24,7 @@ from .workers import AnalyzeTask, FileOpTask, MetaTask, Signals, ViewTask
 APP_NAME = "Fotobudka"
 VERSION = "1.0"
 LABEL_COLORS = {"Red": "#d9534f", "Yellow": "#e8c547", "Green": "#5cb85c", "Blue": "#4a90d9"}
+REJ_PL = {"blur": "automat – nieostre", "series": "automat – słabsze w serii", "manual": "ręcznie"}
 LABEL_PL = {"Red": "czerwona", "Yellow": "żółta", "Green": "zielona", "Blue": "niebieska"}
 
 FILTERS = [
@@ -52,6 +53,7 @@ class Photo:
     thumb: QImage | None = None
     rating: int = 0
     rejected: bool = False
+    rej_by: str | None = None          # blur / series / manual
     label: str | None = None
     group: int = -1
     group_pos: int = 0
@@ -124,10 +126,14 @@ class ThumbDelegate(QStyledItemDelegate):
             tr.moveCenter(img_area.center())
             painter.drawImage(tr, p.thumb)
             if p.rejected:
-                painter.fillRect(tr, QColor(0, 0, 0, 150))
-                painter.setPen(QPen(QColor("#e04646"), 3))
-                painter.drawLine(tr.topLeft(), tr.bottomRight())
-                painter.drawLine(tr.topRight(), tr.bottomLeft())
+                if self.win.reviewing_rejected():
+                    painter.setPen(QPen(QColor("#e04646"), 3))
+                    painter.drawRect(tr.adjusted(1, 1, -1, -1))
+                else:
+                    painter.fillRect(tr, QColor(0, 0, 0, 150))
+                    painter.setPen(QPen(QColor("#e04646"), 3))
+                    painter.drawLine(tr.topLeft(), tr.bottomRight())
+                    painter.drawLine(tr.topRight(), tr.bottomLeft())
         else:
             painter.setPen(QColor("#777"))
             painter.drawText(img_area, Qt.AlignmentFlag.AlignCenter, "błąd" if p.failed else "…")
@@ -262,9 +268,16 @@ class Viewer(QWidget):
         painter.setFont(f)
         box = QRect(14, 12, 420, 34)
         if p.rejected:
-            painter.fillRect(QRect(12, 10, 170, 36), QColor(200, 40, 40, 210))
+            txt = "✕ ODRZUCONE" + (f"  ({REJ_PL[p.rej_by]})" if p.rej_by in REJ_PL else "")
+            w = painter.fontMetrics().horizontalAdvance(txt) + 20
+            painter.fillRect(QRect(12, 10, w, 36), QColor(200, 40, 40, 210))
             painter.setPen(QColor("white"))
-            painter.drawText(box, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "✕ ODRZUCONE")
+            painter.drawText(QRect(14, 12, w, 34), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, txt)
+            if self.win.reviewing_rejected():
+                f2 = QFont(painter.font()); f2.setPointSize(10); f2.setBold(False); painter.setFont(f2)
+                painter.setPen(QColor("#eee"))
+                painter.drawText(QRect(14, 50, 600, 22), Qt.AlignmentFlag.AlignLeft,
+                                 "X – przywróć  •  B – pokaż najlepsze z tej serii  •  Z – zoom 100%")
         elif p.rating:
             painter.fillRect(QRect(12, 10, 22 * p.rating + 16, 36), QColor(0, 0, 0, 150))
             painter.setPen(QColor("#f0c419"))
@@ -346,6 +359,7 @@ HELP = """<b>Skróty</b><br>
 ← → / kółko – poprzednie / następne<br>
 1–5 – ocena, 0 – usuń ocenę<br>
 X – odrzuć / przywróć<br>
+O – przegląd odrzuconych<br>
 6 7 8 9 – etykieta czerw./żółta/ziel./nieb.<br>
 Z / Spacja / klik – zoom 100%<br>
 G / Shift+G – następna / poprzednia seria<br>
@@ -426,6 +440,13 @@ class MainWindow(QMainWindow):
         self.filter_box.currentIndexChanged.connect(lambda _: self.apply_filter())
         self.filter_box.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         tb.addWidget(self.filter_box)
+        self.rej_btn = QPushButton("🗑 Odrzucone (0)")
+        self.rej_btn.setCheckable(True)
+        self.rej_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.rej_btn.setToolTip("Przejrzyj odrzucone zdjęcia – sprawdź, czy automat się nie pomylił (klawisz O)")
+        self.rej_btn.setStyleSheet("QPushButton{padding:3px 10px;} QPushButton:checked{background:#8a2a2a; color:white;}")
+        self.rej_btn.clicked.connect(lambda _: self.toggle_rejected_view())
+        tb.addWidget(self.rej_btn)
         tb.addSeparator()
 
         tb.addWidget(QLabel(" Czułość: "))
@@ -559,6 +580,7 @@ class MainWindow(QMainWindow):
         for k, lab in zip("6789", ["Red", "Yellow", "Green", "Blue"]):
             sc(k, lambda lab=lab: self.toggle_label(lab))
         sc("X", self.toggle_reject)
+        sc("O", self.toggle_rejected_view)
         sc("Z", lambda: self.viewer.set_zoom(not self.viewer.zoom))
         sc("Space", lambda: self.viewer.set_zoom(not self.viewer.zoom))
         sc("G", lambda: self.jump_group(1))
@@ -656,6 +678,7 @@ class MainWindow(QMainWindow):
             s = saved.get(n, {})
             p.rating = int(s.get("r", 0))
             p.rejected = bool(s.get("x", False))
+            p.rej_by = s.get("xb") if p.rejected else None
             p.label = s.get("l")
             if s.get("sz") == st.st_size and abs(s.get("mt", 0) - st.st_mtime) < 2 and "t" in s:
                 p.meta = raw.PhotoMeta(s["t"], s.get("o", 1), s.get("po", 0), s.get("pl", 0))
@@ -812,11 +835,31 @@ class MainWindow(QMainWindow):
         self.apply_act.setToolTip(f"Oznacz {n} sugerowanych zdjęć (nieostre / słabsze w serii) jako odrzucone")
 
     # ------------------------------------------------------------------ filtr / nawigacja
+    REJ_FILTER = 7
+
+    def reviewing_rejected(self) -> bool:
+        return self.filter_box.currentIndex() == self.REJ_FILTER
+
+    def toggle_rejected_view(self):
+        if self.reviewing_rejected():
+            self.filter_box.setCurrentIndex(getattr(self, "_prev_filter", 0))
+        else:
+            if not any(p.rejected for p in self.photos):
+                self.rej_btn.setChecked(False)
+                self.statusBar().showMessage("Brak odrzuconych zdjęć", 4000)
+                return
+            self._prev_filter = self.filter_box.currentIndex()
+            self.cur = None
+            self.filter_box.setCurrentIndex(self.REJ_FILTER)
+            if self.model.rows:
+                self.show_photo(self.model.rows[0])
+
     def apply_filter(self):
         pred = FILTERS[self.filter_box.currentIndex()][1]
         rows = [i for i, p in enumerate(self.photos) if pred(p) or i == self.cur]
         self.model.set_rows(rows)
         self._select_current()
+        self.viewer.update()
         self._update_status()
 
     def _select_current(self):
@@ -947,7 +990,8 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ oceny
     def _snapshot(self, idxs):
-        return [(i, self.photos[i].rating, self.photos[i].rejected, self.photos[i].label) for i in idxs]
+        return [(i, self.photos[i].rating, self.photos[i].rejected, self.photos[i].label, self.photos[i].rej_by)
+                for i in idxs]
 
     def _changed(self, idxs, advance=False):
         for i in idxs:
@@ -980,9 +1024,10 @@ class MainWindow(QMainWindow):
             return
         self.undo.append(self._snapshot([self.cur]))
         p.rejected = not p.rejected
+        p.rej_by = "manual" if p.rejected else None
         if p.rejected:
             p.rating = 0
-        self._changed([self.cur], advance=p.rejected)
+        self._changed([self.cur], advance=p.rejected or self.reviewing_rejected())
 
     def toggle_label(self, lab: str):
         p = self.current_photo()
@@ -996,10 +1041,10 @@ class MainWindow(QMainWindow):
         if not self.undo:
             return
         snap = self.undo.pop()
-        for i, r, x, l in snap:
+        for i, r, x, l, rb in snap:
             if i < len(self.photos):
                 p = self.photos[i]
-                p.rating, p.rejected, p.label = r, x, l
+                p.rating, p.rejected, p.label, p.rej_by = r, x, l, rb
         idxs = [s[0] for s in snap if s[0] < len(self.photos)]
         if len(idxs) == 1:
             self.show_photo(idxs[0])
@@ -1022,6 +1067,7 @@ class MainWindow(QMainWindow):
         self.undo.append(self._snapshot(idxs))
         for i in idxs:
             self.photos[i].rejected = True
+            self.photos[i].rej_by = self.photos[i].reason or "blur"
         self._changed(idxs)
         self.banner_lbl.setText(f"✔ <b>Odrzucono {len(idxs)} zdjęć.</b> Zostało {sum(1 for p in self.photos if not p.rejected)} "
                                 f"do przejrzenia. Cofnięcie: Ctrl+Z. Przycisk „Przenieś odrzucone” schowa je do _ODRZUCONE.")
@@ -1046,6 +1092,8 @@ class MainWindow(QMainWindow):
                 d["r"] = p.rating
             if p.rejected:
                 d["x"] = True
+                if p.rej_by:
+                    d["xb"] = p.rej_by
             if p.label:
                 d["l"] = p.label
             out[p.name] = d
@@ -1171,6 +1219,8 @@ class MainWindow(QMainWindow):
         sug = sum(1 for p in self.photos if p.suggested and not p.rejected)
         series = sum(1 for g in self.groups if len(g.members) > 1)
         shown = len(self.model.rows)
+        self.rej_btn.setText(f"🗑 Odrzucone ({rej})")
+        self.rej_btn.setChecked(self.reviewing_rejected())
         self.status_lbl.setText(
             f"  Zdjęć: {n}   •   widoczne: {shown}   •   serii: {series}   •   ocenione: {rated}   •   "
             f"odrzucone: {rej}   •   sugerowane do odrzutu: {sug}"
@@ -1212,7 +1262,9 @@ class MainWindow(QMainWindow):
                 rows.append("<br><b style='color:#d9822b'>⚠ Prawdopodobnie nieostre</b><br>")
         rows.append("<br>")
         if p.rejected:
-            rows.append("<b style='color:#e04646'>✕ Odrzucone</b>")
+            rows.append("<b style='color:#e04646'>✕ Odrzucone</b>"
+                        + (f"<br><span style='color:#bbb'>przez: {REJ_PL[p.rej_by]}</span>" if p.rej_by in REJ_PL else "")
+                        + "<br><span style='color:#888'>X – przywróć</span>")
         elif p.rating:
             rows.append(f"<span style='color:#f0c419;font-size:18px'>{'★' * p.rating}</span>"
                         f"<span style='color:#444;font-size:18px'>{'★' * (5 - p.rating)}</span>")
