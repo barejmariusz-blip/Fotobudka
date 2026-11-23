@@ -2251,7 +2251,9 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, APP_NAME, warn)
             gallery_ui.LinkDialog(self, gallery.gallery_link(s, g), g["title"], True).exec()
         gallery_ui.run_job(self, "Przygotowanie galerii…",
-                           lambda prog, canc: gallery.publish(s, items, info, s.get("watermark", ""), prog, canc), done)
+                           lambda prog, canc: gallery.publish(s, items, info, {
+                               "text": s.get("watermark", ""), "logo": s.get("logo", ""),
+                               "style": s.get("wm_style", "strong"), "opacity": s.get("wm_opacity", 70)}, prog, canc), done)
 
     def show_galleries(self):
         gallery_ui.ManagerDialog(self).exec()

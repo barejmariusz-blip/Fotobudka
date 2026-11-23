@@ -89,7 +89,7 @@ def gallery_link(s: dict, g: dict) -> str:
 
 # --------------------------------------------------------------------------- obrazy
 def _font(size: int):
-    for name in ("segoeui.ttf", "arial.ttf", "DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"):
+    for name in ("segoeuisb.ttf", "segoeui.ttf", "arial.ttf", "DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"):
         try:
             return ImageFont.truetype(name, size)
         except OSError:
@@ -100,25 +100,71 @@ def _font(size: int):
         return ImageFont.load_default()
 
 
-def watermark(im: Image.Image, text: str) -> Image.Image:
-    if not text:
+WM_STYLES = {"corner": "dyskretny – róg", "strong": "wyraźny – róg + środek", "tiled": "mocny – powtarzany na całym zdjęciu"}
+
+
+def _logo(path: str, width: int, alpha: float):
+    try:
+        lg = Image.open(path).convert("RGBA")
+    except (OSError, ValueError):
+        return None
+    lg = lg.resize((width, max(1, int(lg.height * width / lg.width))), Image.Resampling.LANCZOS)
+    a = lg.getchannel("A").point(lambda v: int(v * alpha))
+    lg.putalpha(a)
+    return lg
+
+
+def watermark(im: Image.Image, text: str, style: str = "strong", logo: str = "", opacity: int = 60) -> Image.Image:
+    """Znak wodny: tekst albo logo PNG. opacity 10..100 (%)."""
+    if not text and not logo:
         return im
     im = im.convert("RGBA")
+    W, H = im.size
+    base = min(W, H)
+    op = max(0.1, min(1.0, opacity / 100))
     layer = Image.new("RGBA", im.size, (0, 0, 0, 0))
     d = ImageDraw.Draw(layer)
-    size = max(14, int(min(im.size) * 0.035))
-    f = _font(size)
-    box = d.textbbox((0, 0), text, font=f)
-    tw, th = box[2] - box[0], box[3] - box[1]
-    m = int(size * 0.8)
-    x, y = im.width - tw - m, im.height - th - m - box[1]
-    d.text((x + 1, y + 1), text, font=f, fill=(0, 0, 0, 90))
-    d.text((x, y), text, font=f, fill=(255, 255, 255, 150))
-    # dyskretny znak na środku utrudnia wycięcie
-    big = _font(int(min(im.size) * 0.09))
-    b = d.textbbox((0, 0), text, font=big)
-    d.text(((im.width - (b[2] - b[0])) / 2, (im.height - (b[3] - b[1])) / 2 - b[1]), text, font=big,
-           fill=(255, 255, 255, 28))
+    lg = _logo(logo, int(base * (0.22 if style == "corner" else 0.30)), op) if logo else None
+
+    def stamp_text(cx, cy, size, alpha, anchor="mm"):
+        f = _font(size)
+        d.text((cx + max(1, size // 18), cy + max(1, size // 18)), text, font=f, fill=(0, 0, 0, int(alpha * 0.45)), anchor=anchor)
+        d.text((cx, cy), text, font=f, fill=(255, 255, 255, alpha), anchor=anchor)
+
+    m = int(base * 0.035)
+    if style == "tiled":
+        if lg:
+            step_x, step_y = int(lg.width * 1.8), int(lg.height * 2.2) + 1
+            for y in range(-lg.height, H, step_y):
+                off = (y // step_y) % 2 * step_x // 2
+                for x in range(-lg.width + off, W, step_x):
+                    layer.alpha_composite(lg, (x, y))
+        else:
+            size = max(12, int(base * 0.06))
+            tile = Image.new("RGBA", (W * 2, H * 2), (0, 0, 0, 0))
+            td = ImageDraw.Draw(tile)
+            f = _font(size)
+            tw = td.textlength(text, font=f) + size * 3
+            for row, y in enumerate(range(0, H * 2, int(size * 4))):
+                x0 = -(row % 2) * tw / 2
+                x = x0
+                while x < W * 2:
+                    td.text((x, y), text, font=f, fill=(255, 255, 255, int(255 * op * 0.55)))
+                    x += tw
+            tile = tile.rotate(30, resample=Image.Resampling.BICUBIC)
+            layer.alpha_composite(tile.crop((W // 2, H // 2, W // 2 + W, H // 2 + H)))
+    else:
+        if lg:
+            layer.alpha_composite(lg, (W - lg.width - m, H - lg.height - m))
+            if style == "strong":
+                big = _logo(logo, int(base * 0.55), op * 0.5)
+                if big:
+                    layer.alpha_composite(big, ((W - big.width) // 2, (H - big.height) // 2))
+        else:
+            size = max(12, int(base * (0.045 if style == "corner" else 0.055)))
+            stamp_text(W - m, H - m, size, int(255 * op), anchor="rd")
+            if style == "strong":
+                stamp_text(W // 2, H // 2, max(14, int(base * 0.12)), int(255 * op * 0.55))
     return Image.alpha_composite(im, layer).convert("RGB")
 
 
@@ -128,14 +174,20 @@ def _jpeg(im: Image.Image, q: int) -> bytes:
     return buf.getvalue()
 
 
-def make_images(path: str, meta, wm: str) -> tuple[bytes, bytes, tuple[int, int]]:
+def make_images(path: str, meta, wm) -> tuple[bytes, bytes, tuple[int, int]]:
+    """wm: dict {text, style, logo, opacity} albo sam tekst."""
+    if isinstance(wm, str):
+        wm = {"text": wm}
+    kw = {"text": wm.get("text", ""), "style": wm.get("style", "strong"), "logo": wm.get("logo", ""),
+          "opacity": int(wm.get("opacity", 60))}
     data = raw.read_preview_bytes(path, meta)
     im = analysis.open_jpeg(data, PREVIEW_EDGE, meta.orientation)
     if max(im.size) > PREVIEW_EDGE:
         im.thumbnail((PREVIEW_EDGE, PREVIEW_EDGE), Image.Resampling.LANCZOS)
-    prev = watermark(im, wm)
+    prev = watermark(im, **kw)
     th = im.copy()
     th.thumbnail((THUMB_EDGE, THUMB_EDGE), Image.Resampling.LANCZOS)
+    th = watermark(th, **kw)
     return _jpeg(prev, 82), _jpeg(th, 78), prev.size
 
 
@@ -151,7 +203,7 @@ def decrypt(key: bytes, blob: bytes) -> bytes:
     return AESGCM(key).decrypt(blob[:12], blob[12:], None)
 
 
-def build_files(items: list[tuple[str, object, str]], info: dict, wm: str, progress=None,
+def build_files(items: list[tuple[str, object, str]], info: dict, wm, progress=None,
                 cancelled=lambda: False) -> tuple[str, str, dict[str, bytes]]:
     """items: [(ścieżka, meta, nazwa wyświetlana)] -> (id, klucz b64u, {ścieżka_w_repo: bajty})."""
     gid = "g" + b64u(secrets.token_bytes(9)).replace("-", "x").replace("_", "y")
@@ -333,7 +385,7 @@ def _short(s: str) -> str:
 
 
 # --------------------------------------------------------------------------- wysokopoziomowo
-def publish(settings: dict, items, info: dict, wm: str, progress=None, cancelled=lambda: False) -> dict:
+def publish(settings: dict, items, info: dict, wm, progress=None, cancelled=lambda: False) -> dict:
     settings["owner"], settings["repo"] = parse_repo(settings["owner"], settings["repo"])
     gh = GitHub(settings["owner"], settings["repo"], settings["token"])
     branch = gh.check()

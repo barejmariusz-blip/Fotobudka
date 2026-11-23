@@ -81,7 +81,30 @@ class SettingsDialog(QDialog):
         self.phone = QLineEdit(s.get("phone", ""))
         self.phone.setPlaceholderText("+48…  (do SMS / WhatsApp)")
         lay.addRow("Nazwa studia:", self.studio)
-        lay.addRow("Znak wodny:", self.wm)
+        lay.addRow("Znak wodny (tekst):", self.wm)
+        lh = QHBoxLayout()
+        self.logo = QLineEdit(s.get("logo", ""))
+        self.logo.setPlaceholderText("albo logo PNG (z przezroczystością)")
+        pick = QPushButton("Wybierz…")
+        pick.clicked.connect(self.pick_logo)
+        lh.addWidget(self.logo)
+        lh.addWidget(pick)
+        lay.addRow("Logo:", lh)
+        self.wm_style = QComboBox()
+        for k, v in gallery.WM_STYLES.items():
+            self.wm_style.addItem(v, k)
+        self.wm_style.setCurrentIndex(max(0, self.wm_style.findData(s.get("wm_style", "strong"))))
+        self.wm_op = QSpinBox()
+        self.wm_op.setRange(10, 100)
+        self.wm_op.setSuffix(" % krycia")
+        self.wm_op.setValue(int(s.get("wm_opacity", 70)))
+        sh = QHBoxLayout()
+        sh.addWidget(self.wm_style)
+        sh.addWidget(self.wm_op)
+        prev = QPushButton("👁 Podgląd")
+        prev.clicked.connect(self.preview)
+        sh.addWidget(prev)
+        lay.addRow("Wygląd znaku:", sh)
         lay.addRow("E-mail do wyboru:", self.email)
         lay.addRow("Telefon do wyboru:", self.phone)
         test = QPushButton("Sprawdź połączenie")
@@ -95,8 +118,36 @@ class SettingsDialog(QDialog):
     def values(self):
         owner, repo = gallery.parse_repo(self.owner.text(), self.repo.text())
         return {"owner": owner, "repo": repo, "token": self.token.text().strip(),
+                "logo": self.logo.text().strip(), "wm_style": self.wm_style.currentData(),
+                "wm_opacity": self.wm_op.value(),
                 "studio": self.studio.text().strip(), "watermark": self.wm.text().strip(),
                 "email": self.email.text().strip(), "phone": self.phone.text().strip()}
+
+    def pick_logo(self):
+        from PySide6.QtWidgets import QFileDialog
+        f, _ = QFileDialog.getOpenFileName(self, "Logo", "", "Obrazy (*.png *.webp *.jpg)")
+        if f:
+            self.logo.setText(f)
+
+    def preview(self):
+        from PySide6.QtGui import QPixmap, QImage
+        from PIL import Image
+        v = self.values()
+        src = getattr(self.parent(), "current_photo", lambda: None)()
+        if src is not None and src.meta is not None:
+            from . import analysis, raw
+            im = analysis.open_jpeg(raw.read_preview_bytes(src.path, src.meta), 1200, src.meta.orientation)
+        else:
+            im = Image.new("RGB", (1200, 800), (120, 110, 100))
+        out = gallery.watermark(im, v["watermark"], v["wm_style"], v["logo"], v["wm_opacity"]).convert("RGB")
+        q = QImage(out.tobytes("raw", "RGB"), out.width, out.height, out.width * 3, QImage.Format.Format_RGB888).copy()
+        d = QDialog(self)
+        d.setWindowTitle("Podgląd znaku wodnego")
+        lb = QLabel()
+        lb.setPixmap(QPixmap.fromImage(q).scaled(900, 700, Qt.AspectRatioMode.KeepAspectRatio,
+                                                Qt.TransformationMode.SmoothTransformation))
+        QVBoxLayout(d).addWidget(lb)
+        d.exec()
 
     def test(self):
         v = self.values()
