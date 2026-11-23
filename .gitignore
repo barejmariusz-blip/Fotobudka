@@ -3,3 +3,6 @@ build/
 dist/
 *.spec
 fotobudka/_version.py
+ai_cache/
+fotobudka/_model.py
+fotobudka/data/labels.npz

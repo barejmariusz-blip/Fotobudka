@@ -24,6 +24,9 @@ class Signals(QObject):
     view_loaded = Signal(int, int, bool, object)         # gen, idx, full, QImage | None
     progress = Signal(int, int, str)                     # done, total, current name
     finished = Signal(int, int, list)                    # ok, failed, errors
+    ai_done = Signal(int, int, object)                   # gen, idx, embedding | None
+    dl_progress = Signal(int, int)                       # pobrano, razem
+    dl_done = Signal(str)                                # "" = ok, inaczej błąd
 
 
 class MetaTask(QRunnable):
@@ -53,8 +56,9 @@ class AnalyzeTask(QRunnable):
             data = raw.read_preview_bytes(self.path, self.meta)
             if self.need_score:
                 im = analysis.open_jpeg(data, analysis.ANALYSIS_EDGE, self.meta.orientation)
-                score = analysis.sharpness_score(im)
-                extras = {"ev": analysis.exposure_stats(im), "h": analysis.dhash(im)}
+                score, tiles = analysis.sharpness_score(im, return_tiles=True)
+                sig, mean = analysis.subject_signature(im, tiles)
+                extras = {"ev": analysis.exposure_stats(im), "h": analysis.dhash(im), "c": sig, "cm": mean}
             else:
                 im = analysis.open_jpeg(data, analysis.THUMB_EDGE * 2, self.meta.orientation)
             im.thumbnail((analysis.THUMB_EDGE, analysis.THUMB_EDGE))
@@ -78,6 +82,36 @@ class ViewTask(QRunnable):
         except Exception:
             pass
         self.sig.view_loaded.emit(self.gen, self.idx, self.max_edge is None, img)
+
+
+class AITask(QRunnable):
+    def __init__(self, sig: Signals, gen: int, idx: int, path: str, meta):
+        super().__init__()
+        self.sig, self.gen, self.idx, self.path, self.meta = sig, gen, idx, path, meta
+
+    def run(self):
+        emb = None
+        try:
+            from . import ai
+            emb = ai.embed_photo(raw.read_preview_bytes(self.path, self.meta), self.meta.orientation)
+        except Exception:
+            traceback.print_exc()
+        self.sig.ai_done.emit(self.gen, self.idx, emb)
+
+
+class DownloadTask(QRunnable):
+    def __init__(self, sig: Signals):
+        super().__init__()
+        self.sig = sig
+        self.cancelled = False
+
+    def run(self):
+        try:
+            from . import ai
+            ai.download_model(lambda d, t: self.sig.dl_progress.emit(d, t), lambda: self.cancelled)
+            self.sig.dl_done.emit("")
+        except Exception as e:
+            self.sig.dl_done.emit(str(e) or e.__class__.__name__)
 
 
 class FileOpTask(QRunnable):

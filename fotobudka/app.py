@@ -11,15 +11,15 @@ from PySide6.QtCore import (QAbstractListModel, QModelIndex, QPointF, QRect, QRe
                             QSize, Qt, QThreadPool, QTimer)
 from PySide6.QtGui import (QAction, QColor, QFont, QGuiApplication, QImage, QKeySequence, QPainter,
                            QPalette, QPen, QPixmap)
-from PySide6.QtWidgets import QPushButton
+from PySide6.QtWidgets import QInputDialog, QPushButton
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
                                QDoubleSpinBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel,
                                QListView, QMainWindow, QMessageBox, QProgressBar, QProgressDialog,
                                QSlider, QSpinBox, QSplitter, QStyle, QStyledItemDelegate, QToolBar,
                                QVBoxLayout, QWidget)
 
-from . import analysis, raw, storage
-from .workers import AnalyzeTask, FileOpTask, MetaTask, Signals, ViewTask
+from . import ai, analysis, raw, storage
+from .workers import AITask, AnalyzeTask, DownloadTask, FileOpTask, MetaTask, Signals, ViewTask
 
 APP_NAME = "Fotobudka"
 try:
@@ -71,6 +71,10 @@ class Photo:
     ev: tuple | None = None              # (wypalone, jasność top 0.5%, średnia)
     hash: str | None = None              # dHash do podobnych kadrów
     expo: str | None = None              # over / under
+    csig: list | None = None             # histogram kolorów obiektu
+    cmean: list | None = None            # średni kolor obiektu RGB
+    animal: int = -1                     # grupa (zwierzę)
+    emb: object = None                   # embedding AI (numpy) albo None
 
 
 # =========================================================================== miniatury
@@ -150,6 +154,13 @@ class ThumbDelegate(QStyledItemDelegate):
         if p.group_len > 1:
             col = QColor("#2f8f8f") if p.group % 2 == 0 else QColor("#7a5aa8")
             painter.fillRect(QRect(r.left(), r.bottom() - 3, r.width(), 4), col)
+
+        # kropka zwierzęcia
+        if p.animal >= 0 and len(self.win.animals) > 1:
+            painter.setPen(QPen(QColor("#111"), 1))
+            painter.setBrush(QColor(*[int(c) for c in self.win.animals[p.animal]["rgb"]]))
+            painter.drawEllipse(QRect(r.right() - 17, r.top() + 4, 13, 13))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
 
         # etykieta kolorowa
         if p.label:
@@ -563,12 +574,18 @@ class MainWindow(QMainWindow):
         self.sig.meta_done.connect(self._on_meta)
         self.sig.analyzed.connect(self._on_analyzed)
         self.sig.view_loaded.connect(self._on_view)
+        self.sig.ai_done.connect(self._on_ai)
+        self.ai_left = 0
+        self.ai_total = 0
+        self.ai_running = False
+        self.animal_names: list[dict] = []   # [{"v": b64 środek grupy, "n": nazwa}]
 
         self.save_timer = QTimer(self, singleShot=True, interval=1200, timeout=self._save_now)
         self.suggest_timer = QTimer(self, singleShot=True, interval=600, timeout=self._recompute)
 
         self._build_ui()
         self._load_settings()
+        self._update_ai_btn()
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
@@ -619,6 +636,36 @@ class MainWindow(QMainWindow):
         self.exif_btn.clicked.connect(self.open_exif_filter)
         tb.addWidget(self.exif_btn)
         self.exif_dlg = None
+        tb.addWidget(QLabel("  Zwierzę: "))
+        self.animal_box = QComboBox()
+        self.animal_box.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.animal_box.setMinimumWidth(170)
+        self.animal_box.setToolTip("Pokaż zdjęcia tylko jednego zwierzęcia (rozpoznawane po kolorach obiektu w ostrości)")
+        self.animal_box.addItem("wszystkie", -1)
+        self.animal_box.currentIndexChanged.connect(lambda _: self.apply_filter())
+        tb.addWidget(self.animal_box)
+        self.k_spin = QSpinBox()
+        self.k_spin.setRange(0, 8)
+        self.k_spin.setSpecialValueText("ile: auto")
+        self.k_spin.setPrefix("ile: ")
+        self.k_spin.setToolTip("Ile zwierząt jest na sesji (auto = program sam ocenia)")
+        self.k_spin.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        self.k_spin.valueChanged.connect(lambda _: self._settings_changed())
+        tb.addWidget(self.k_spin)
+        self.rename_btn = QPushButton("✎")
+        self.rename_btn.setFixedWidth(28)
+        self.rename_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.rename_btn.setToolTip("Nazwij wybraną grupę (np. „Pani Ania – Luna”). Nazwa zostaje przy kolejnych otwarciach.")
+        self.rename_btn.clicked.connect(self.rename_animal)
+        tb.addWidget(self.rename_btn)
+        self.ai_btn = QPushButton("🐾 AI")
+        self.ai_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.ai_btn.setStyleSheet("QPushButton{padding:3px 8px;}")
+        self.ai_btn.clicked.connect(self.ai_button)
+        tb.addWidget(self.ai_btn)
+        self.animals: list[dict] = []
+        self.applied_k = 0
+        self._ak_cache: dict = {}
         tb.addSeparator()
 
         tb.addWidget(QLabel(" Czułość: "))
@@ -813,7 +860,11 @@ class MainWindow(QMainWindow):
         for w_ in (self.mode_box, self.sim):
             w_.blockSignals(False)
         self.applied_sens, self.applied_gap = self.sens.value(), self.gap.value()
+        self.k_spin.blockSignals(True)
+        self.k_spin.setValue(int(s.value("k", 0)))
+        self.k_spin.blockSignals(False)
         self.applied_mode, self.applied_sim = self.mode_box.currentData(), self.sim.value()
+        self.applied_k = self.k_spin.value()
         self._mode_widgets()
         self.sens_lbl.setText(f" {self.applied_sens}%")
         self.auto_adv.setChecked(s.value("auto_adv", "true") in (True, "true"))
@@ -829,6 +880,7 @@ class MainWindow(QMainWindow):
         s.setValue("gap", self.gap.value())
         s.setValue("mode", self.mode_box.currentData())
         s.setValue("sim", self.sim.value())
+        s.setValue("k", self.k_spin.value())
         s.setValue("auto_adv", self.auto_adv.isChecked())
         s.setValue("auto_xmp", self.auto_xmp.isChecked())
         self.pool.clear()
@@ -856,6 +908,9 @@ class MainWindow(QMainWindow):
         self.settings.setValue("last_folder", folder)
         self.setWindowTitle(f"{APP_NAME} v{VERSION} – {folder}")
         self.state = storage.load_state(folder)
+        self.animal_names = [n for n in self.state.get("names", []) if isinstance(n, dict) and n.get("v")]
+        self.ai_running = False
+        self.ai_left = 0
         self.photos = []
         self.groups = []
         self.cur = None
@@ -873,6 +928,9 @@ class MainWindow(QMainWindow):
             self.exif_dlg.deleteLater()
             self.exif_dlg = None
         self.set_exif_filter(None, "")
+        self.animals = []
+        self._ak_cache = {}
+        self._fill_animal_box()
         self._update_apply()
 
         names = sorted(n for n in os.listdir(folder)
@@ -911,6 +969,12 @@ class MainWindow(QMainWindow):
                     p.score, p.hash = s.get("s"), s.get("h")
                     p.ev = tuple(s["ev"]) if s.get("ev") else None
                     p.expo = analysis.exposure_flag(p.ev)
+                    p.csig, p.cmean = s.get("c"), s.get("cm")
+            if s.get("e") and p.meta is not None:
+                try:
+                    p.emb = ai.from_b64(s["e"])
+                except Exception:
+                    p.emb = None
             self.photos.append(p)
             if p.meta is None:
                 need_meta.append(len(self.photos) - 1)
@@ -977,6 +1041,7 @@ class MainWindow(QMainWindow):
         p = self.photos[idx]
         if extras:
             p.ev, p.hash = extras["ev"], extras["h"]
+            p.csig, p.cmean = extras["c"], extras["cm"]
             p.expo = analysis.exposure_flag(p.ev)
         if thumb is None:
             p.failed = True
@@ -998,6 +1063,7 @@ class MainWindow(QMainWindow):
         self.progress.setVisible(False)
         self._regroup(recompute=False)
         self._recompute()
+        self._cluster_animals()
         self.apply_filter()
         self._save_state_cache()
         n = len(self.photos)
@@ -1017,6 +1083,9 @@ class MainWindow(QMainWindow):
         under = sum(1 for p in self.photos if p.expo == "under")
         if over or under:
             txt += f"<br>Ekspozycja: ☀ {over} prześwietlonych, ☾ {under} niedoświetlonych (filtr pokaże je osobno)."
+        if len(self.animals) > 1:
+            txt += f"<br>Zwierzęta ({'AI' if self._ai_mode() else 'wg kolorów'}): " + ", ".join(
+                f"<span style='color:{a['hex']}'>●</span> {a['name']} ({a['n']})" for a in self.animals)
         if blur + weak == 0:
             txt += "<br>Nic nie wymaga odrzucenia – możesz od razu oceniać."
         self.banner_lbl.setText(txt)
@@ -1025,6 +1094,9 @@ class MainWindow(QMainWindow):
         self.banner.setVisible(True)
         self.statusBar().showMessage("Analiza zakończona", 8000)
         QApplication.alert(self, 0)
+        self._update_ai_btn()
+        if ai.available() and ai.model_ready():
+            self.start_ai()
 
     def best_count(self):
         return sum(1 for p in self.photos if p.best)
@@ -1043,7 +1115,8 @@ class MainWindow(QMainWindow):
         self._mode_widgets()
         mode = self.mode_box.currentData()
         pending = (self.sens.value() != self.applied_sens or abs(self.gap.value() - self.applied_gap) > 1e-9
-                   or mode != self.applied_mode or (mode == "sim" and self.sim.value() != self.applied_sim))
+                   or mode != self.applied_mode or (mode == "sim" and self.sim.value() != self.applied_sim)
+                   or self.k_spin.value() != self.applied_k)
         ready = bool(self.photos) and not self.analysis_running
         self.recalc_btn.setEnabled(pending and ready)
         if pending and ready:
@@ -1051,11 +1124,193 @@ class MainWindow(QMainWindow):
             new = self._count_pending(self.sens.value(), self.gap.value(), mode, self.sim.value())
             diff = new - now
             ng = sum(1 for g in self._group_lists(mode, self.gap.value(), self.sim.value()) if len(g) > 1)
-            self.preview_lbl.setText(f"po przeliczeniu: {ng} grup, {new} do odrzutu ({'+' if diff >= 0 else ''}{diff})")
+            na = len(set(x for x in self._animal_labels(self.k_spin.value()) if x >= 0))
+            self.preview_lbl.setText(f"po przeliczeniu: {ng} grup, {new} do odrzutu ({'+' if diff >= 0 else ''}{diff}), "
+                                     f"{na} zwierz.")
         elif pending and self.analysis_running:
             self.preview_lbl.setText("zostanie użyte po zakończeniu analizy")
         else:
             self.preview_lbl.setText("")
+
+    def _animal_labels(self, k: int) -> list[int]:
+        key = (k, len(self.photos), sum(1 for p in self.photos if p.csig), sum(1 for p in self.photos if p.emb is not None),
+               tuple(p.name for p in self.photos[:3]))
+        if key not in self._ak_cache:
+            self._ak_cache = {kk: v for kk, v in self._ak_cache.items() if kk[1:] == key[1:]}
+            if self._ai_mode():
+                self._ak_cache[key] = ai.cluster([p.emb for p in self.photos], self.AI_THRESHOLD, k)
+            else:
+                self._ak_cache[key] = analysis.animal_clusters([p.csig for p in self.photos], k)
+        return self._ak_cache[key]
+
+    AI_THRESHOLD = 0.86
+
+    def _ai_mode(self) -> bool:
+        return bool(self.photos) and all(p.emb is not None or p.failed for p in self.photos) \
+            and any(p.emb is not None for p in self.photos)
+
+    def _cluster_animals(self):
+        self.applied_k = self.k_spin.value()
+        if not self.photos or any(p.csig is None and not p.failed for p in self.photos):
+            return
+        labels = self._animal_labels(self.applied_k)
+        self.animals = []
+        for i, p in enumerate(self.photos):
+            p.animal = labels[i]
+        aim = self._ai_mode()
+        stored = [(ai.from_b64(n["v"]), n["n"]) for n in self.animal_names]
+        for c in sorted(set(x for x in labels if x >= 0)):
+            members = [p for p in self.photos if p.animal == c]
+            ms = [p.cmean for p in members if p.cmean]
+            rgb = [sum(m[j] for m in ms) / len(ms) for j in range(3)] if ms else [128, 128, 128]
+            a = {"rgb": rgb, "hex": "#%02x%02x%02x" % tuple(int(v) for v in rgb), "n": len(members),
+                 "name": analysis.color_name(rgb), "centroid": None, "custom": False}
+            if aim:
+                cen = ai.centroid([p.emb for p in members if p.emb is not None])
+                a["centroid"] = cen
+                best = max(stored, key=lambda t: float(t[0] @ cen), default=None)
+                if best is not None and float(best[0] @ cen) >= 0.90:
+                    a["name"], a["custom"] = best[1], True
+                else:
+                    nm, prob = ai.name_for(cen)
+                    a["name"] = nm if nm and prob >= 0.20 else f"zwierzę {c + 1}"
+            self.animals.append(a)
+        self._fill_animal_box()
+
+    # ------------------------------------------------------------------ AI
+    def _update_ai_btn(self):
+        if not ai.available():
+            self.ai_btn.setVisible(False)
+            return
+        if self.ai_running:
+            self.ai_btn.setText("🐾 AI: pracuje…")
+            self.ai_btn.setEnabled(False)
+        elif not ai.model_ready():
+            self.ai_btn.setText("🐾 Włącz AI")
+            self.ai_btn.setEnabled(True)
+            self.ai_btn.setToolTip("Rozpoznawanie zwierząt i ras przez AI (model ok. 90 MB pobierany jeden raz).\n"
+                                   "Bez AI zdjęcia są grupowane tylko po kolorach.")
+        else:
+            self.ai_btn.setText("🐾 AI ✔" if self._ai_mode() else "🐾 Uruchom AI")
+            self.ai_btn.setEnabled(not self._ai_mode() and bool(self.photos) and not self.analysis_running)
+            self.ai_btn.setToolTip("Zwierzęta rozpoznane przez AI" if self._ai_mode() else "Rozpoznaj zwierzęta (AI)")
+        self.rename_btn.setEnabled(self._ai_mode() and len(self.animals) > 1)
+
+    def ai_button(self):
+        if not ai.model_ready():
+            self.download_ai()
+        else:
+            self.start_ai()
+
+    def download_ai(self):
+        if QMessageBox.question(self, APP_NAME,
+                                "Pobrać model AI do rozpoznawania zwierząt (ok. 90 MB)?\n\n"
+                                "Pobiera się jeden raz, potem działa bez internetu.\n"
+                                "Zdjęcia nigdzie nie są wysyłane – wszystko liczy się na tym komputerze.") \
+                != QMessageBox.StandardButton.Yes:
+            return
+        sig = Signals()
+        task = DownloadTask(sig)
+        dlg = QProgressDialog("Pobieranie modelu AI…", "Przerwij", 0, 100, self)
+        dlg.setWindowTitle(APP_NAME)
+        dlg.setWindowModality(Qt.WindowModality.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.canceled.connect(lambda: setattr(task, "cancelled", True))
+        sig.dl_progress.connect(lambda d, t: (dlg.setMaximum(max(1, t // 1048576)), dlg.setValue(d // 1048576),
+                                              dlg.setLabelText(f"Pobieranie modelu AI… {d // 1048576} / {t // 1048576} MB")))
+
+        def done(err):
+            dlg.close()
+            if err:
+                QMessageBox.warning(self, APP_NAME, f"Nie udało się pobrać modelu:\n{err}")
+            else:
+                self.statusBar().showMessage("Model AI pobrany", 5000)
+                if self.photos and not self.analysis_running:
+                    self.start_ai()
+            self._update_ai_btn()
+        sig.dl_done.connect(done)
+        self._dl_sig = sig
+        self.pool.start(task, 10)
+
+    def start_ai(self):
+        if self.ai_running or not self.photos or self.analysis_running:
+            return
+        todo = [i for i, p in enumerate(self.photos) if p.emb is None and not p.failed and p.meta]
+        if not todo:
+            self._cluster_animals()
+            self.apply_filter()
+            self._update_ai_btn()
+            return
+        self.ai_running = True
+        self.ai_total = self.ai_left = len(todo)
+        self.ai_t0 = time.time()
+        self._update_ai_btn()
+        self._progress(0, self.ai_total, "Etap 3/3 – rozpoznawanie zwierząt (AI)")
+        for i in todo:
+            p = self.photos[i]
+            self.pool.start(AITask(self.sig, self.gen, i, p.path, p.meta))
+
+    def _on_ai(self, gen, idx, emb):
+        if gen != self.gen or not self.ai_running:
+            return
+        if emb is not None:
+            self.photos[idx].emb = emb
+        self.ai_left -= 1
+        self._progress(self.ai_total - self.ai_left, self.ai_total,
+                       "Etap 3/3 – rozpoznawanie zwierząt (AI)", eta_from=self.ai_t0)
+        if self.ai_left == 0:
+            self.ai_running = False
+            self._ak_cache = {}
+            self._cluster_animals()
+            self.apply_filter()
+            self._save_now()
+            self._update_ai_btn()
+            self.progress.setVisible(False)
+            if len(self.animals) > 0:
+                txt = ("🐾 <b>Rozpoznawanie zwierząt zakończone</b> — " +
+                       ", ".join(f"<span style='color:{a['hex']}'>●</span> <b>{a['name']}</b> ({a['n']})"
+                                 for a in self.animals) +
+                       "<br>Wybierz zwierzę z listy „Zwierzę”. ✎ nadaje grupie własną nazwę (np. imię klientki).")
+                self.banner_lbl.setText(txt)
+                self.banner_apply.setVisible(False)
+                self.banner.setStyleSheet("background:#1f2f3d; color:#e6e6e6;")
+                self.banner.setVisible(True)
+
+    def rename_animal(self):
+        c = self.animal_box.currentData()
+        if c is None or c < 0:
+            QMessageBox.information(self, APP_NAME, "Najpierw wybierz grupę z listy „Zwierzę”.")
+            return
+        a = self.animals[c]
+        if a.get("centroid") is None:
+            return
+        name, ok = QInputDialog.getText(self, APP_NAME, "Nazwa grupy (np. „Pani Ania – Luna”):", text=a["name"])
+        if not ok or not name.strip():
+            return
+        cen = a["centroid"]
+        self.animal_names = [n for n in self.animal_names if float(ai.from_b64(n["v"]) @ cen) < 0.90]
+        self.animal_names.append({"v": ai.to_b64(cen), "n": name.strip()})
+        a["name"], a["custom"] = name.strip(), True
+        self._fill_animal_box()
+        self._update_info()
+        self._save_now()
+
+    def _fill_animal_box(self):
+        cur = self.animal_box.currentData()
+        self.animal_box.blockSignals(True)
+        self.animal_box.clear()
+        self.animal_box.addItem("wszystkie", -1)
+        if len(self.animals) > 1:
+            for i, a in enumerate(self.animals):
+                pm = QPixmap(14, 14)
+                pm.fill(QColor(a["hex"]))
+                from PySide6.QtGui import QIcon
+                self.animal_box.addItem(QIcon(pm), f"{i + 1}: {a['name']} ({a['n']})", i)
+        idx = self.animal_box.findData(cur if cur is not None else -1)
+        self.animal_box.setCurrentIndex(max(0, idx))
+        self.animal_box.setEnabled(len(self.animals) > 1)
+        self.animal_box.blockSignals(False)
+        self._update_ai_btn()
 
     def _mode_widgets(self):
         sim = self.mode_box.currentData() == "sim"
@@ -1065,9 +1320,11 @@ class MainWindow(QMainWindow):
     def recalc(self):
         old_sens, old_gap = self.applied_sens, self.applied_gap
         old_mode, old_sim = self.applied_mode, self.applied_sim
+        old_animals = len(self.animals)
         before = sum(1 for p in self.photos if p.suggested and not p.rejected and p.rating == 0)
         self._regroup(recompute=False)
         self._recompute()
+        self._cluster_animals()
         self.apply_filter()
         if self.cur is not None:
             self.show_photo(self.cur)
@@ -1084,6 +1341,8 @@ class MainWindow(QMainWindow):
         if self.applied_mode == "time" and abs(self.applied_gap - old_gap) > 1e-9:
             changes.append(f"seria co {old_gap:g} s → {self.applied_gap:g} s")
         changes.append(f"{series} {'grup' if self.applied_mode == 'sim' else 'serii'}")
+        if len(self.animals) != old_animals:
+            changes.append(f"zwierzęta: {old_animals} → {len(self.animals)}")
         txt = (f"🔄 <b>Przeliczono</b> ({', '.join(changes)}). "
                f"Sugerowane do odrzutu: <b>{after}</b> (było {before}).")
         if any(p.rejected and p.rej_by in ("blur", "series") for p in self.photos):
@@ -1118,6 +1377,7 @@ class MainWindow(QMainWindow):
             return
         inv = {old: new for new, old in enumerate(order)}
         self._gl_cache = {}
+        self._ak_cache = {}
         self.photos = [self.photos[i] for i in order]
         if self.cur is not None:
             self.cur = inv.get(self.cur)
@@ -1229,7 +1489,9 @@ class MainWindow(QMainWindow):
     def apply_filter(self):
         pred = FILTERS[self.filter_box.currentIndex()][1]
         ex = self.exif_filter or (lambda p: True)
-        rows = [i for i, p in enumerate(self.photos) if (pred(p) and ex(p)) or i == self.cur]
+        an = self.animal_box.currentData() if self.animal_box.currentData() is not None else -1
+        rows = [i for i, p in enumerate(self.photos)
+                if (pred(p) and ex(p) and (an < 0 or p.animal == an)) or i == self.cur]
         self.model.set_rows(rows)
         self._select_current()
         self.viewer.update()
@@ -1468,6 +1730,10 @@ class MainWindow(QMainWindow):
                     d["ev"] = [round(v, 4) for v in p.ev]
                 if p.hash:
                     d["h"] = p.hash
+                if p.csig:
+                    d["c"], d["cm"] = p.csig, p.cmean
+            if p.emb is not None:
+                d["e"] = ai.to_b64(p.emb)
             if p.rating:
                 d["r"] = p.rating
             if p.rejected:
@@ -1477,7 +1743,7 @@ class MainWindow(QMainWindow):
             if p.label:
                 d["l"] = p.label
             out[p.name] = d
-        self.state = {"app": f"{APP_NAME} {VERSION}", "photos": out}
+        self.state = {"app": f"{APP_NAME} {VERSION}", "photos": out, "names": self.animal_names}
         try:
             storage.save_state(self.folder, self.state)
         except OSError as e:
@@ -1632,6 +1898,10 @@ class MainWindow(QMainWindow):
             if m.lens or m.model:
                 rows.append(f"<div style='color:#888;font-size:11px'>{' • '.join(x for x in (m.model, m.lens) if x)}</div>")
             rows.append("<br>")
+        if p.animal >= 0 and len(self.animals) > 1:
+            a = self.animals[p.animal]
+            rows.append(f"Zwierzę: <span style='color:{a['hex']}'>●</span> <b>{a['name']}</b>"
+                        f" <span style='color:#888'>(grupa {p.animal + 1})</span><br>")
         word = "Grupa podobnych" if self.applied_mode == "sim" else "Seria"
         if p.group_len > 1:
             rows.append(f"{word} #{p.group + 1}: zdjęcie <b>{p.group_pos + 1}</b> z {p.group_len}<br>")

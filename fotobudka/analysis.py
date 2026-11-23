@@ -39,7 +39,7 @@ def open_jpeg(data: bytes, max_edge: int | None, orientation: int) -> Image.Imag
     return apply_orientation(im, orientation)
 
 
-METRIC_VERSION = 3
+METRIC_VERSION = 4
 
 
 def _box1d(a: np.ndarray, k: int, axis: int) -> np.ndarray:
@@ -52,7 +52,7 @@ def _box1d(a: np.ndarray, k: int, axis: int) -> np.ndarray:
     return ((np.take(c, range(k, k + n), axis=axis) - np.take(c, range(0, n), axis=axis)) / k).astype(np.float32)
 
 
-def sharpness_score(img: Image.Image, grid: int = 12, k: int = 9) -> float:
+def sharpness_score(img: Image.Image, grid: int = 12, k: int = 9, return_tiles: bool = False):
     """Ostrość 0..1 najostrzejszego miejsca kadru (np. oczu), niezależna od kontrastu i tła.
 
     Metoda „ponownego rozmycia” (Crete i in.): obraz rozmywa się filtrem 9 px i mierzy,
@@ -66,7 +66,7 @@ def sharpness_score(img: Image.Image, grid: int = 12, k: int = 9) -> float:
     h, w = g.shape[0] - 1, g.shape[1] - 1
     th, tw = h // grid, w // grid
     if th < 8 or tw < 8:
-        return 0.0
+        return (0.0, None) if return_tiles else 0.0
 
     def tiles(a):
         return a[:th * grid, :tw * grid].reshape(grid, th, grid, tw).sum(axis=(1, 3))
@@ -82,7 +82,138 @@ def sharpness_score(img: Image.Image, grid: int = 12, k: int = 9) -> float:
     for F, V in per_axis:
         s = V.ravel()[top] / np.maximum(F.ravel()[top], 1e-6)
         res.append(float(np.sort(s)[::-1][:2].mean()))
-    return min(res)
+    if not return_tiles:
+        return min(res)
+    F = per_axis[0][0] + per_axis[1][0]
+    V = per_axis[0][1] + per_axis[1][1]
+    sharp = V / np.maximum(F, 1e-6)
+    act = F / max(float(F.max()), 1e-6)
+    return min(res), (sharp ** 2) * act        # waga kafelka: ostry i z detalem = obiekt
+
+
+# ------------------------------------------------------------------ zwierzę / kolorystyka
+def subject_signature(img: Image.Image, tiles: np.ndarray | None) -> tuple[list[float], list[float]]:
+    """Histogram kolorów obiektu w ostrości (najczęściej zwierzę) + jego średni kolor RGB.
+
+    Obiekt = 12% kafelków z największą wagą (ostre i z detalem); tło w bokeh jest pomijane.
+    Biny: 12 odcieni x 2 nasycenia + 3 neutralne (ciemny / szary / jasny) = 27.
+    """
+    small = img.convert("RGB").resize((192, 128) if img.width >= img.height else (128, 192),
+                                      Image.Resampling.BILINEAR)
+    rgb = np.asarray(small, dtype=np.float32)
+    hsv = np.asarray(small.convert("HSV"), dtype=np.float32)
+    h, w = rgb.shape[:2]
+    mask = np.ones((h, w), dtype=bool)
+    if tiles is not None:
+        g = tiles.shape[0]
+        thr = np.quantile(tiles, 0.88)
+        sel = tiles >= thr
+        mask = np.kron(sel, np.ones((int(np.ceil(h / g)), int(np.ceil(w / g))), dtype=bool))[:h, :w]
+        if mask.sum() < 50:
+            mask = np.ones((h, w), dtype=bool)
+    H, S, V = hsv[..., 0][mask], hsv[..., 1][mask], hsv[..., 2][mask]
+    neutral = (S < 45) | (V < 45)
+    hist = np.zeros(27, dtype=np.float64)
+    hb = np.minimum((H[~neutral] / 256 * 12).astype(int), 11)
+    sb = (S[~neutral] >= 130).astype(int)
+    np.add.at(hist, hb * 2 + sb, 1)
+    vb = np.where(V[neutral] < 70, 0, np.where(V[neutral] < 170, 1, 2))
+    np.add.at(hist, 24 + vb, 1)
+    hist /= max(hist.sum(), 1)
+    mean = rgb[mask].mean(axis=0)
+    return [round(float(x), 4) for x in hist], [round(float(x), 1) for x in mean]
+
+
+def _kmeans(X: np.ndarray, k: int, seed: int = 0, iters: int = 40) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    n = len(X)
+    C = [X[rng.integers(n)]]
+    for _ in range(1, k):
+        d = np.min(((X[:, None, :] - np.array(C)[None]) ** 2).sum(-1), axis=1)
+        C.append(X[rng.choice(n, p=d / d.sum())] if d.sum() > 0 else X[rng.integers(n)])
+    C = np.array(C)
+    lab = np.zeros(n, dtype=int)
+    for _ in range(iters):
+        d = ((X[:, None, :] - C[None]) ** 2).sum(-1)
+        new = d.argmin(1)
+        if (new == lab).all() and _ > 0:
+            break
+        lab = new
+        for j in range(k):
+            if (lab == j).any():
+                C[j] = X[lab == j].mean(0)
+    return lab
+
+
+def _silhouette(X: np.ndarray, lab: np.ndarray) -> float:
+    if len(set(lab.tolist())) < 2:
+        return -1.0
+    if len(X) > 800:   # próbka dla szybkości
+        idx = np.random.default_rng(1).choice(len(X), 800, replace=False)
+        X, lab = X[idx], lab[idx]
+    D = np.sqrt(((X[:, None, :] - X[None]) ** 2).sum(-1))
+    s = []
+    for i in range(len(X)):
+        same = lab == lab[i]
+        if same.sum() <= 1:
+            s.append(0.0)
+            continue
+        a = D[i, same].sum() / (same.sum() - 1)
+        b = min(D[i, lab == j].mean() for j in set(lab.tolist()) if j != lab[i])
+        s.append((b - a) / max(a, b, 1e-9))
+    return float(np.mean(s))
+
+
+def animal_clusters(sigs: list[list[float] | None], k: int = 0) -> list[int]:
+    """Przypisanie zdjęć do grup kolorystycznych (0..k-1); -1 = brak danych.
+
+    k = 0 -> automatycznie 1..6 (najlepszy wskaźnik silhouette; poniżej 0.25 = jedna grupa).
+    Odległość Hellingera (pierwiastek z histogramu + euklides).
+    """
+    idx = [i for i, s in enumerate(sigs) if s]
+    out = [-1] * len(sigs)
+    if not idx:
+        return out
+    X = np.sqrt(np.array([sigs[i] for i in idx], dtype=np.float64))
+    if k == 1 or len(idx) < 4:
+        lab = np.zeros(len(idx), dtype=int)
+    elif k > 1:
+        lab = _kmeans(X, min(k, len(idx)))
+    else:
+        best, lab = 0.25, np.zeros(len(idx), dtype=int)
+        for kk in range(2, min(6, len(idx) - 1) + 1):
+            l2 = _kmeans(X, kk)
+            sc = _silhouette(X, l2)
+            if sc > best + 0.02:
+                best, lab = sc, l2
+    # numeracja wg liczności (największa grupa = 1)
+    order = [c for c, _ in sorted(((c, (lab == c).sum()) for c in set(lab.tolist())), key=lambda t: -t[1])]
+    remap = {c: i for i, c in enumerate(order)}
+    for j, i in enumerate(idx):
+        out[i] = remap[int(lab[j])]
+    return out
+
+
+def color_name(rgb) -> str:
+    import colorsys
+    r, g, b = (c / 255 for c in rgb)
+    h, s, v = colorsys.rgb_to_hsv(r, g, b)
+    if v < 0.25:
+        return "ciemne"
+    if s < 0.18:
+        return "jasne" if v > 0.7 else "szare"
+    hd = h * 360
+    if hd < 15 or hd >= 330:
+        return "czerwonawe"
+    if hd < 45:
+        return "rude / brązowe" if v < 0.75 else "rude / kremowe"
+    if hd < 70:
+        return "złote / żółte"
+    if hd < 170:
+        return "zielonkawe"
+    if hd < 260:
+        return "niebieskawe"
+    return "fioletowe"
 
 
 @dataclass
