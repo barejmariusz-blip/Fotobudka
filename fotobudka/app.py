@@ -624,7 +624,7 @@ class MainWindow(QMainWindow):
         self.filter_box = QComboBox()
         for name, _ in FILTERS:
             self.filter_box.addItem(name)
-        self.filter_box.currentIndexChanged.connect(lambda _: self.apply_filter())
+        self.filter_box.currentIndexChanged.connect(lambda _: self.apply_filter(False))
         self.filter_box.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         tb.addWidget(self.filter_box)
         self.rej_btn = QPushButton("🗑 Odrzucone (0)")
@@ -1462,12 +1462,12 @@ class MainWindow(QMainWindow):
             if not self._compute_search(sv["q"]):
                 return
             self.search_query = ""          # filtr idzie przez pozycję listy, nie przez pole
-            self.apply_filter()
+            self.apply_filter(False)
             return
         if self.search_query == "":
             for p in self.photos:
                 p.match = False
-        self.apply_filter()
+        self.apply_filter(False)
 
     def _search_ready(self) -> bool:
         if not self._ai_mode():
@@ -1793,7 +1793,7 @@ class MainWindow(QMainWindow):
         self.exif_btn.setProperty("active", "true" if active else "false")
         self.exif_btn.style().unpolish(self.exif_btn)
         self.exif_btn.style().polish(self.exif_btn)
-        self.apply_filter()
+        self.apply_filter(False)
 
     def reviewing_rejected(self) -> bool:
         return self.filter_box.currentIndex() == self.REJ_FILTER
@@ -1812,7 +1812,9 @@ class MainWindow(QMainWindow):
             if self.model.rows:
                 self.show_photo(self.model.rows[0])
 
-    def apply_filter(self):
+    def apply_filter(self, keep_current: bool = True):
+        """keep_current=True: oglądane zdjęcie zostaje na pasku, choć już nie pasuje (np. po ocenie
+        w widoku „Nieocenione”). Przy zmianie filtra/grupy (False) - pokazujemy tylko pasujące."""
         pred = FILTERS[self.filter_box.currentIndex()][1]
         ex = self.exif_filter or (lambda p: True)
         an = self.animal_box.currentData() if self.animal_box.currentData() is not None else -1
@@ -1828,8 +1830,17 @@ class MainWindow(QMainWindow):
         if an >= 2000:
             am = lambda p: p.match  # noqa: E731
         sm = (lambda p: p.match) if self.search_query else (lambda p: True)
-        rows = [i for i, p in enumerate(self.photos) if (pred(p) and ex(p) and am(p) and sm(p)) or i == self.cur]
+        rows = [i for i, p in enumerate(self.photos)
+                if (pred(p) and ex(p) and am(p) and sm(p)) or (keep_current and i == self.cur)]
         self.model.set_rows(rows)
+        if not keep_current and self.cur not in rows:
+            if rows:
+                self.show_photo(rows[0])
+            else:
+                self.cur = None
+                self.viewer.set_pixmaps(None, None)
+                self.viewer.message = "Brak zdjęć dla wybranego filtra / grupy"
+                self._update_info()
         self._select_current()
         self.viewer.update()
         self._update_status()
