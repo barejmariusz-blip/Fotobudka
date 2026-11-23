@@ -116,6 +116,13 @@ def main():
     for i in ok:
         gh.setdefault(items[i][0], []).append(res[i]["c"])
     print("::notice::Rasa dla grupy: " + ", ".join(f"{t}->{ai.name_for(v)[0]}" for t, v in gh.items()))
+    # diagnostyka: czy tekst wielojęzyczny trafia w przestrzeń CLIP
+    names, T = ai.labels()
+    for pl_name, en in [("dalmatyńczyk", "a photo of a Dalmatian dog."), ("mops", "a photo of a Pug.")]:
+        j = names.index(pl_name)
+        a1, a2 = ai.text_embed(en), ai.text_embed(pl_name)
+        print(f"::warning::DIAG {pl_name}: cos(mclip EN, clip label)={float(a1 @ T[j]):.3f} cos(mclip PL, clip label)={float(a2 @ T[j]):.3f} "
+              f"cos(EN,PL)={float(a1 @ a2):.3f} tokens={ai._tok.encode(pl_name).tokens[:8]}")
     # wyszukiwanie opisem po polsku
     queries = {"dalmatyńczyk": "Dalmatian", "biały pies w czarne łatki": "Dalmatian", "mops": "Pug",
                "husky z niebieskimi oczami": "Husky", "szary kot": "BritishSH", "rudy pies": "Golden",
