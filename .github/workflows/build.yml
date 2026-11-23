@@ -23,9 +23,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
 
+      - name: Set version
+        shell: bash
+        run: echo 'VERSION = "1.0.${{ github.run_number }}"' > fotobudka/_version.py
+
       - name: Build EXE
         run: >
-          pyinstaller main.py --name Fotobudka --onefile --windowed --noconfirm
+          pyinstaller main.py --name Fotobudka_v1.0.${{ github.run_number }} --onefile --windowed --noconfirm
           --exclude-module tkinter
           --exclude-module PySide6.QtNetwork
           --exclude-module PySide6.QtQml
@@ -34,7 +38,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: Fotobudka-Windows
-          path: dist/Fotobudka.exe
+          path: dist/Fotobudka_v1.0.${{ github.run_number }}.exe
 
       - name: Publish release with EXE
         uses: softprops/action-gh-release@v2
@@ -43,5 +47,5 @@ jobs:
           name: Fotobudka 1.0.${{ github.run_number }}
           target_commitish: ${{ github.sha }}
           make_latest: true
-          body: "Pobierz **Fotobudka.exe** poniżej (Assets)."
-          files: dist/Fotobudka.exe
+          body: "Pobierz **Fotobudka_v1.0.${{ github.run_number }}.exe** poniżej (Assets)."
+          files: dist/Fotobudka_v1.0.${{ github.run_number }}.exe

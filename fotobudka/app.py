@@ -22,7 +22,10 @@ from . import analysis, raw, storage
 from .workers import AnalyzeTask, FileOpTask, MetaTask, Signals, ViewTask
 
 APP_NAME = "Fotobudka"
-VERSION = "1.0"
+try:
+    from ._version import VERSION
+except ImportError:
+    VERSION = "dev"
 LABEL_COLORS = {"Red": "#d9534f", "Yellow": "#e8c547", "Green": "#5cb85c", "Blue": "#4a90d9"}
 REJ_PL = {"blur": "automat – nieostre", "series": "automat – słabsze w serii", "manual": "ręcznie"}
 LABEL_PL = {"Red": "czerwona", "Yellow": "żółta", "Green": "zielona", "Blue": "niebieska"}
@@ -529,7 +532,7 @@ F11 – pełny ekran"""
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(f"{APP_NAME} – selekcja zdjęć")
+        self.setWindowTitle(f"{APP_NAME} v{VERSION} – selekcja zdjęć")
         self.settings = QSettings("PanRodla", APP_NAME)
         self.folder: str | None = None
         self.photos: list[Photo] = []
@@ -757,7 +760,7 @@ class MainWindow(QMainWindow):
         self.progress.setMinimumWidth(380)
         self.progress.setVisible(False)
         self.progress.setTextVisible(True)
-        sign = QLabel("made by PanRodla  ")
+        sign = QLabel(f"v{VERSION}  •  made by PanRodla  ")
         sign.setStyleSheet("color:#666;")
         self.statusBar().addWidget(self.status_lbl, 1)
         self.statusBar().addPermanentWidget(self.progress)
@@ -851,7 +854,7 @@ class MainWindow(QMainWindow):
         self.view_pool.clear()
         self.folder = folder
         self.settings.setValue("last_folder", folder)
-        self.setWindowTitle(f"{APP_NAME} – {folder}")
+        self.setWindowTitle(f"{APP_NAME} v{VERSION} – {folder}")
         self.state = storage.load_state(folder)
         self.photos = []
         self.groups = []
