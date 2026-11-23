@@ -35,7 +35,6 @@ Szybki program na Windows do przeglądania i odsiewu zdjęć po sesji (stworzony
 - Pliki .xmp powstają tylko dla RAW-ów, bo Lightroom nie czyta plików .xmp dla JPG.
 
 ## Budowanie
-EXE buduje się automatycznie w GitHub Actions: zakładka **Actions → ostatni build → Artifacts → Fotobudka-Windows**.
-Tag `v1.0` dodatkowo publikuje EXE w zakładce Releases.
+EXE buduje się automatycznie przy każdej zmianie i trafia do **Releases**: https://github.com/barejmariusz-blip/Fotobudka/releases/latest
 
 Uruchomienie ze źródeł: `pip install -r requirements.txt` → `python main.py`
