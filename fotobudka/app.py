@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
 
@@ -10,6 +11,7 @@ from PySide6.QtCore import (QAbstractListModel, QModelIndex, QPointF, QRect, QRe
                             QSize, Qt, QThreadPool, QTimer)
 from PySide6.QtGui import (QAction, QColor, QFont, QGuiApplication, QImage, QKeySequence, QPainter,
                            QPalette, QPen, QPixmap)
+from PySide6.QtWidgets import QPushButton
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
                                QDoubleSpinBox, QFileDialog, QFormLayout, QHBoxLayout, QLabel,
                                QListView, QMainWindow, QMessageBox, QProgressBar, QProgressDialog,
@@ -55,6 +57,7 @@ class Photo:
     group_pos: int = 0
     group_len: int = 1
     suggested: bool = False
+    reason: str | None = None
     rel: float | None = None
     best: bool = False
     failed: bool = False
@@ -372,6 +375,9 @@ class MainWindow(QMainWindow):
         self.meta_left = 0
         self.analyze_left = 0
         self.analyze_total = 0
+        self.analysis_running = False
+        self.analysis_t0 = 0.0
+        self.analysis_cached = False
 
         self.pool = QThreadPool()
         self.pool.setMaxThreadCount(max(2, (os.cpu_count() or 4) - 2))
@@ -443,8 +449,9 @@ class MainWindow(QMainWindow):
         self.gap.valueChanged.connect(lambda _: self._regroup())
         tb.addWidget(self.gap)
         tb.addSeparator()
-        act("✔ Zastosuj sugestie", self.apply_suggestions, None,
-            "Oznacz sugerowane (nieostre / słabsze w serii) jako odrzucone")
+        self.apply_act = act("✔ Zastosuj sugestie", self.apply_suggestions, None,
+                             "Oznacz sugerowane (nieostre / słabsze w serii) jako odrzucone")
+        self.apply_act.setEnabled(False)
         self.auto_adv = QCheckBox("Auto-dalej")
         self.auto_adv.setToolTip("Po ocenie / odrzuceniu przejdź automatycznie do następnego")
         self.auto_adv.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -496,10 +503,29 @@ class MainWindow(QMainWindow):
         self.strip.clicked.connect(lambda mi: self.show_photo(mi.data(Qt.ItemDataRole.UserRole)))
         self.strip.setStyleSheet("QListView{background:#1c1c1c; border:none;}")
 
+        self.banner = QWidget()
+        bl = QHBoxLayout(self.banner)
+        bl.setContentsMargins(14, 8, 8, 8)
+        self.banner_lbl = QLabel()
+        self.banner_lbl.setTextFormat(Qt.TextFormat.RichText)
+        self.banner_lbl.setWordWrap(True)
+        self.banner_apply = QPushButton("Zastosuj sugestie")
+        self.banner_apply.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.banner_apply.clicked.connect(self.apply_suggestions)
+        close_btn = QPushButton("✕")
+        close_btn.setFixedWidth(30)
+        close_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        close_btn.clicked.connect(lambda: self.banner.setVisible(False))
+        bl.addWidget(self.banner_lbl, 1)
+        bl.addWidget(self.banner_apply)
+        bl.addWidget(close_btn)
+        self.banner.setVisible(False)
+
         central = QWidget()
         cl = QVBoxLayout(central)
         cl.setContentsMargins(0, 0, 0, 0)
         cl.setSpacing(0)
+        cl.addWidget(self.banner)
         cl.addWidget(top, 1)
         cl.addWidget(self.strip)
         self.setCentralWidget(central)
@@ -507,7 +533,7 @@ class MainWindow(QMainWindow):
         # status
         self.status_lbl = QLabel()
         self.progress = QProgressBar()
-        self.progress.setMaximumWidth(260)
+        self.progress.setMinimumWidth(380)
         self.progress.setVisible(False)
         self.progress.setTextVisible(True)
         sign = QLabel("made by PanRodla  ")
@@ -599,6 +625,9 @@ class MainWindow(QMainWindow):
         self.pending_view.clear()
         self.viewer.set_pixmaps(None, None)
         self.model.set_rows([])
+        self.banner.setVisible(False)
+        self.analysis_running = False
+        self._update_apply()
 
         names = sorted(n for n in os.listdir(folder)
                        if os.path.splitext(n)[1].lower() in raw.SUPPORTED_EXT
@@ -636,8 +665,12 @@ class MainWindow(QMainWindow):
                 need_meta.append(len(self.photos) - 1)
 
         self.meta_left = len(need_meta)
+        self.analysis_t0 = time.time()
+        self.analysis_cached = not need_meta and all(p.score is not None for p in self.photos)
         if need_meta:
-            self._progress(0, len(need_meta), "Odczyt metadanych")
+            self.analysis_running = True
+            self._update_apply()
+            self._progress(0, len(need_meta), "Etap 1/2 – odczyt plików")
             for i in need_meta:
                 self.pool.start(MetaTask(self.sig, self.gen, i, self.photos[i].path))
         else:
@@ -654,7 +687,7 @@ class MainWindow(QMainWindow):
         p.score = None
         self.meta_left -= 1
         total = self.progress.maximum()
-        self._progress(total - self.meta_left, total, "Odczyt metadanych")
+        self._progress(total - self.meta_left, total, "Etap 1/2 – odczyt plików")
         if self.meta_left == 0:
             self._after_meta()
 
@@ -671,8 +704,10 @@ class MainWindow(QMainWindow):
         self._save_state_cache()
         # analiza: miniatury + ostrość
         self.analyze_total = self.analyze_left = len(self.photos)
-        self._progress(0, self.analyze_total, "Analiza ostrości")
-        # najpierw okolice bieżącego, potem reszta
+        self.analysis_running = True
+        self.analysis_t1 = time.time()
+        self._update_apply()
+        self._progress(0, self.analyze_total, self._stage2_name())
         for i in range(len(self.photos)):
             p = self.photos[i]
             if p.failed:
@@ -680,7 +715,10 @@ class MainWindow(QMainWindow):
                 continue
             self.pool.start(AnalyzeTask(self.sig, self.gen, i, p.path, p.meta, p.score is None))
         if self.analyze_left == 0:
-            self.progress.setVisible(False)
+            self._analysis_finished()
+
+    def _stage2_name(self):
+        return "Wczytywanie miniatur" if self.analysis_cached else "Etap 2/2 – analiza ostrości"
 
     def _on_analyzed(self, gen, idx, score, thumb):
         if gen != self.gen:
@@ -695,13 +733,40 @@ class MainWindow(QMainWindow):
         self.model.refresh_photo(idx)
         self.analyze_left -= 1
         done = self.analyze_total - self.analyze_left
-        self._progress(done, self.analyze_total, "Analiza ostrości")
-        if score is not None and (done % 40 == 0 or self.analyze_left == 0):
+        self._progress(done, self.analyze_total, self._stage2_name(), eta_from=self.analysis_t1)
+        if score is not None and done % 40 == 0:
             self.suggest_timer.start()
         if self.analyze_left == 0:
-            self.progress.setVisible(False)
-            self._recompute()
-            self._save_state_cache()
+            self._analysis_finished()
+
+    def _analysis_finished(self):
+        self.analysis_running = False
+        self.progress.setVisible(False)
+        self._recompute()
+        self._save_state_cache()
+        n = len(self.photos)
+        series = sum(1 for g in self.groups if len(g.members) > 1)
+        blur = sum(1 for p in self.photos if p.suggested and p.reason == "blur" and not p.rejected)
+        weak = sum(1 for p in self.photos if p.suggested and p.reason == "series" and not p.rejected)
+        failed = sum(1 for p in self.photos if p.failed)
+        secs = int(time.time() - self.analysis_t0)
+        head = ("✔ <b>Analiza wczytana z poprzedniego razu</b>" if self.analysis_cached
+                else f"✔ <b>Analiza zakończona</b> w {secs // 60}:{secs % 60:02d}")
+        txt = (f"{head} — {n} zdjęć, {series} serii, {self.best_count()} najlepszych klatek (TOP).<br>"
+               f"Do odrzutu: <b>{blur + weak}</b> ({blur} nieostrych, {weak} wyraźnie słabszych w serii).")
+        if failed:
+            txt += f"<br><span style='color:#e07070'>Nie udało się odczytać {failed} plików.</span>"
+        if blur + weak == 0:
+            txt += "<br>Nic nie wymaga odrzucenia – możesz od razu oceniać."
+        self.banner_lbl.setText(txt)
+        self.banner_apply.setVisible(blur + weak > 0)
+        self.banner.setStyleSheet("background:#1f3d2a; color:#e6e6e6;")
+        self.banner.setVisible(True)
+        self.statusBar().showMessage("Analiza zakończona", 8000)
+        QApplication.alert(self, 0)
+
+    def best_count(self):
+        return sum(1 for p in self.photos if p.best)
 
     # ------------------------------------------------------------------ serie / sugestie
     def _regroup(self, recompute=True):
@@ -720,10 +785,11 @@ class MainWindow(QMainWindow):
         if not self.groups:
             return
         scores = [p.score for p in self.photos]
-        rejects, rel = analysis.suggest(scores, self.groups, self.sens.value() / 100)
+        rejects, rel, reasons = analysis.suggest(scores, self.groups, self.sens.value() / 100)
         best = {g.best for g in self.groups if g.best is not None}
         for i, p in enumerate(self.photos):
             p.suggested = i in rejects
+            p.reason = reasons.get(i)
             p.rel = rel.get(i)
             p.best = i in best
         if self.filter_box.currentIndex() in (8, 9):
@@ -732,6 +798,18 @@ class MainWindow(QMainWindow):
             self.strip.viewport().update()
         self._update_info()
         self._update_status()
+        self._update_apply()
+
+    def _update_apply(self):
+        if self.analysis_running:
+            self.apply_act.setEnabled(False)
+            self.apply_act.setText("⏳ Analiza trwa…")
+            self.apply_act.setToolTip("Poczekaj na koniec analizy – wtedy sugestie będą kompletne")
+            return
+        n = sum(1 for p in self.photos if p.suggested and not p.rejected and p.rating == 0)
+        self.apply_act.setEnabled(n > 0)
+        self.apply_act.setText(f"✔ Zastosuj sugestie ({n})" if n else "✔ Brak sugestii")
+        self.apply_act.setToolTip(f"Oznacz {n} sugerowanych zdjęć (nieostre / słabsze w serii) jako odrzucone")
 
     # ------------------------------------------------------------------ filtr / nawigacja
     def apply_filter(self):
@@ -884,6 +962,7 @@ class MainWindow(QMainWindow):
             self.apply_filter()
         else:
             self._update_status()
+        self._update_apply()
 
     def set_rating(self, n: int):
         p = self.current_photo()
@@ -928,22 +1007,26 @@ class MainWindow(QMainWindow):
 
     def apply_suggestions(self):
         idxs = [i for i, p in enumerate(self.photos) if p.suggested and not p.rejected and p.rating == 0]
-        if not idxs:
-            QMessageBox.information(self, APP_NAME, "Brak sugerowanych zdjęć do odrzucenia (albo analiza jeszcze trwa).")
+        if self.analysis_running:
             return
-        if self.analyze_left > 0:
-            extra = f"\n\nUwaga: analiza trwa jeszcze ({self.analyze_left} zdjęć) – lista może się zmienić."
-        else:
-            extra = ""
+        if not idxs:
+            QMessageBox.information(self, APP_NAME, "Analiza zakończona – brak zdjęć do odrzucenia.")
+            return
+        blur = sum(1 for i in idxs if self.photos[i].reason == "blur")
         if QMessageBox.question(self, APP_NAME,
                                 f"Oznaczyć {len(idxs)} zdjęć jako odrzucone?\n"
-                                f"(Zdjęcia z oceną nie są ruszane. Można cofnąć Ctrl+Z.){extra}") \
+                                f"• {blur} nieostrych\n• {len(idxs) - blur} wyraźnie słabszych od najlepszego w serii\n\n"
+                                f"Zdjęcia z oceną nie są ruszane. Można cofnąć Ctrl+Z.") \
                 != QMessageBox.StandardButton.Yes:
             return
         self.undo.append(self._snapshot(idxs))
         for i in idxs:
             self.photos[i].rejected = True
         self._changed(idxs)
+        self.banner_lbl.setText(f"✔ <b>Odrzucono {len(idxs)} zdjęć.</b> Zostało {sum(1 for p in self.photos if not p.rejected)} "
+                                f"do przejrzenia. Cofnięcie: Ctrl+Z. Przycisk „Przenieś odrzucone” schowa je do _ODRZUCONE.")
+        self.banner_apply.setVisible(False)
+        self.banner.setVisible(True)
 
     # ------------------------------------------------------------------ zapis
     def _save_state_cache(self):
@@ -1071,11 +1154,15 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Skopiowano {len(sel)} nazw do schowka", 5000)
 
     # ------------------------------------------------------------------ info
-    def _progress(self, done, total, what):
+    def _progress(self, done, total, what, eta_from=None):
         self.progress.setVisible(done < total)
         self.progress.setMaximum(max(1, total))
         self.progress.setValue(done)
-        self.progress.setFormat(f"{what}: {done}/{total}")
+        eta = ""
+        if eta_from and done >= 5 and done < total:
+            left = (time.time() - eta_from) / done * (total - done)
+            eta = f" – zostało ok. {int(left // 60)}:{int(left % 60):02d}" if left >= 60 else f" – zostało ok. {int(left) + 1} s"
+        self.progress.setFormat(f"{what}: {done}/{total}{eta}")
 
     def _update_status(self):
         n = len(self.photos)
@@ -1086,7 +1173,8 @@ class MainWindow(QMainWindow):
         shown = len(self.model.rows)
         self.status_lbl.setText(
             f"  Zdjęć: {n}   •   widoczne: {shown}   •   serii: {series}   •   ocenione: {rated}   •   "
-            f"odrzucone: {rej}   •   sugerowane do odrzutu: {sug}")
+            f"odrzucone: {rej}   •   sugerowane do odrzutu: {sug}"
+            + ("   (analiza w toku – liczby jeszcze się zmienią)" if self.analysis_running else ""))
 
     def _update_info(self):
         p = self.current_photo()
@@ -1118,7 +1206,7 @@ class MainWindow(QMainWindow):
         if p.best:
             rows.append("<br><b style='color:#e0b020'>★ Najlepsze w serii</b><br>")
         if p.suggested and not p.rejected:
-            if p.group_len > 1 and not (p.rel is not None and p.rel < 0.10 + 0.35 * self.sens.value() / 100):
+            if p.reason == "series":
                 rows.append("<br><b style='color:#d9822b'>⚠ Wyraźnie słabsze od najlepszego w serii</b><br>")
             else:
                 rows.append("<br><b style='color:#d9822b'>⚠ Prawdopodobnie nieostre</b><br>")

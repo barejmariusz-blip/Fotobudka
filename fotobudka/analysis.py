@@ -79,8 +79,8 @@ def build_groups(times: list[float], gap: float) -> list[Group]:
     return groups
 
 
-def suggest(scores: list[float | None], groups: list[Group], sensitivity: float) -> tuple[set[int], dict[int, float]]:
-    """Zwraca (indeksy sugerowane do odrzutu, ostrość względna 0..1+ dla każdego).
+def suggest(scores: list[float | None], groups: list[Group], sensitivity: float) -> tuple[set[int], dict[int, float], dict[int, str]]:
+    """Zwraca (sugerowane do odrzutu, ostrość względna 0..1+, powód: 'blur' | 'series').
 
     sensitivity 0..1: wyżej = więcej odrzutów.
     Względna ostrość = wynik / 90. percentyl sesji (odporne na pojedyncze wyjątki).
@@ -91,8 +91,9 @@ def suggest(scores: list[float | None], groups: list[Group], sensitivity: float)
     valid = [s for s in scores if s is not None and s > 0]
     rel: dict[int, float] = {}
     rejects: set[int] = set()
+    reasons: dict[int, str] = {}
     if not valid:
-        return rejects, rel
+        return rejects, rel, reasons
     ref = float(np.percentile(valid, 90)) or 1.0
     t_session = 0.10 + 0.35 * sensitivity    # 0.10 .. 0.45
     t_group = 0.30 + 0.45 * sensitivity      # 0.30 .. 0.75
@@ -106,6 +107,8 @@ def suggest(scores: list[float | None], groups: list[Group], sensitivity: float)
             rel[i] = s / ref
             if s / ref < t_session:
                 rejects.add(i)
+                reasons[i] = "blur"
             elif len(sc) > 1 and bs > 0 and s < t_group * bs:
                 rejects.add(i)
-    return rejects, rel
+                reasons[i] = "series"
+    return rejects, rel, reasons
