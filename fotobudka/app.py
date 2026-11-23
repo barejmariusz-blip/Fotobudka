@@ -431,7 +431,10 @@ class MainWindow(QMainWindow):
         act("📤 Kopiuj wybrane…", lambda: self.export(False), None, "Skopiuj wybrane zdjęcia do innego folderu")
         act("🗑 Przenieś odrzucone…", self.move_rejected, None, "Przenieś odrzucone do podfolderu _ODRZUCONE")
         act("📋 Lista nazw", self.copy_names, None, "Skopiuj do schowka nazwy plików wybranych zdjęć")
-        tb.addSeparator()
+        self.addToolBarBreak()
+        tb = QToolBar("Selekcja")
+        tb.setMovable(False)
+        self.addToolBar(tb)
 
         tb.addWidget(QLabel(" Filtr: "))
         self.filter_box = QComboBox()
@@ -456,8 +459,11 @@ class MainWindow(QMainWindow):
         self.sens.setFixedWidth(110)
         self.sens.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.sens.setToolTip("Im wyżej, tym więcej zdjęć trafia do sugerowanych odrzutów")
-        self.sens.valueChanged.connect(lambda _: self.suggest_timer.start())
+        self.sens.valueChanged.connect(lambda _: self._settings_changed())
         tb.addWidget(self.sens)
+        self.sens_lbl = QLabel(" 50%")
+        self.sens_lbl.setMinimumWidth(38)
+        tb.addWidget(self.sens_lbl)
 
         tb.addWidget(QLabel("  Seria co: "))
         self.gap = QDoubleSpinBox()
@@ -467,8 +473,19 @@ class MainWindow(QMainWindow):
         self.gap.setSuffix(" s")
         self.gap.setToolTip("Zdjęcia zrobione w odstępie mniejszym niż ten czas = jedna seria")
         self.gap.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
-        self.gap.valueChanged.connect(lambda _: self._regroup())
+        self.gap.valueChanged.connect(lambda _: self._settings_changed())
         tb.addWidget(self.gap)
+        self.recalc_btn = QPushButton("🔄 Przelicz")
+        self.recalc_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.recalc_btn.setEnabled(False)
+        self.recalc_btn.setToolTip("Przelicz sugestie dla nowej czułości / długości serii")
+        self.recalc_btn.setStyleSheet("QPushButton{padding:3px 10px;} "
+                                      "QPushButton:enabled{background:#b5651d; color:white; font-weight:bold;}")
+        self.recalc_btn.clicked.connect(self.recalc)
+        tb.addWidget(self.recalc_btn)
+        self.preview_lbl = QLabel("")
+        self.preview_lbl.setStyleSheet("color:#e0a060; padding-left:6px;")
+        tb.addWidget(self.preview_lbl)
         tb.addSeparator()
         self.apply_act = act("✔ Zastosuj sugestie", self.apply_suggestions, None,
                              "Oznacz sugerowane (nieostre / słabsze w serii) jako odrzucone")
@@ -597,10 +614,14 @@ class MainWindow(QMainWindow):
             self.restoreGeometry(g)
         else:
             self.resize(1500, 950)
+        self.sens.blockSignals(True)
         self.sens.setValue(int(s.value("sens", 50)))
+        self.sens.blockSignals(False)
         self.gap.blockSignals(True)
         self.gap.setValue(float(s.value("gap", 1.5)))
         self.gap.blockSignals(False)
+        self.applied_sens, self.applied_gap = self.sens.value(), self.gap.value()
+        self.sens_lbl.setText(f" {self.applied_sens}%")
         self.auto_adv.setChecked(s.value("auto_adv", "true") in (True, "true"))
         self.auto_xmp.setChecked(s.value("auto_xmp", "true") in (True, "true"))
 
@@ -792,11 +813,58 @@ class MainWindow(QMainWindow):
         return sum(1 for p in self.photos if p.best)
 
     # ------------------------------------------------------------------ serie / sugestie
+    def _count_pending(self, sens: int, gap: float) -> int:
+        """Ile zdjęć byłoby do odrzutu przy podanych ustawieniach (bez zmiany stanu)."""
+        if not self.photos or any(p.meta is None for p in self.photos):
+            return 0
+        groups = analysis.build_groups([p.meta.capture_time or 0 for p in self.photos], gap)
+        rej, _, _ = analysis.suggest([p.score for p in self.photos], groups, sens / 100)
+        return sum(1 for i in rej if not self.photos[i].rejected and self.photos[i].rating == 0)
+
+    def _settings_changed(self):
+        self.sens_lbl.setText(f" {self.sens.value()}%")
+        pending = (self.sens.value() != self.applied_sens or abs(self.gap.value() - self.applied_gap) > 1e-9)
+        ready = bool(self.photos) and not self.analysis_running
+        self.recalc_btn.setEnabled(pending and ready)
+        if pending and ready:
+            now = self._count_pending(self.applied_sens, self.applied_gap)
+            new = self._count_pending(self.sens.value(), self.gap.value())
+            diff = new - now
+            self.preview_lbl.setText(f"po przeliczeniu: {new} do odrzutu ({'+' if diff >= 0 else ''}{diff})")
+        elif pending and self.analysis_running:
+            self.preview_lbl.setText("zostanie użyte po zakończeniu analizy")
+        else:
+            self.preview_lbl.setText("")
+
+    def recalc(self):
+        old_sens, old_gap = self.applied_sens, self.applied_gap
+        before = sum(1 for p in self.photos if p.suggested and not p.rejected and p.rating == 0)
+        self._regroup(recompute=False)
+        self._recompute()
+        self._settings_changed()
+        after = sum(1 for p in self.photos if p.suggested and not p.rejected and p.rating == 0)
+        series = sum(1 for g in self.groups if len(g.members) > 1)
+        changes = []
+        if self.applied_sens != old_sens:
+            changes.append(f"czułość {old_sens}% → {self.applied_sens}%")
+        if abs(self.applied_gap - old_gap) > 1e-9:
+            changes.append(f"seria co {old_gap:g} s → {self.applied_gap:g} s ({series} serii)")
+        txt = (f"🔄 <b>Przeliczono</b> ({', '.join(changes)}). "
+               f"Sugerowane do odrzutu: <b>{after}</b> (było {before}).")
+        if any(p.rejected and p.rej_by in ("blur", "series") for p in self.photos):
+            txt += ("<br>Zdjęcia odrzucone wcześniej zostają odrzucone – przy niższej czułości "
+                    "sprawdź je przyciskiem 🗑 Odrzucone (X przywraca).")
+        self.banner_lbl.setText(txt)
+        self.banner_apply.setVisible(after > 0)
+        self.banner.setStyleSheet("background:#3d2f1f; color:#e6e6e6;")
+        self.banner.setVisible(True)
+
     def _regroup(self, recompute=True):
         if not self.photos or any(p.meta is None for p in self.photos):
             return
         times = [p.meta.capture_time or 0 for p in self.photos]
-        self.groups = analysis.build_groups(times, self.gap.value())
+        self.applied_gap = self.gap.value()
+        self.groups = analysis.build_groups(times, self.applied_gap)
         for g in self.groups:
             for pos, i in enumerate(g.members):
                 p = self.photos[i]
@@ -808,7 +876,8 @@ class MainWindow(QMainWindow):
         if not self.groups:
             return
         scores = [p.score for p in self.photos]
-        rejects, rel, reasons = analysis.suggest(scores, self.groups, self.sens.value() / 100)
+        self.applied_sens = self.sens.value()
+        rejects, rel, reasons = analysis.suggest(scores, self.groups, self.applied_sens / 100)
         best = {g.best for g in self.groups if g.best is not None}
         for i, p in enumerate(self.photos):
             p.suggested = i in rejects
@@ -822,6 +891,7 @@ class MainWindow(QMainWindow):
         self._update_info()
         self._update_status()
         self._update_apply()
+        self._settings_changed()
 
     def _update_apply(self):
         if self.analysis_running:
@@ -1072,6 +1142,7 @@ class MainWindow(QMainWindow):
         self.banner_lbl.setText(f"✔ <b>Odrzucono {len(idxs)} zdjęć.</b> Zostało {sum(1 for p in self.photos if not p.rejected)} "
                                 f"do przejrzenia. Cofnięcie: Ctrl+Z. Przycisk „Przenieś odrzucone” schowa je do _ODRZUCONE.")
         self.banner_apply.setVisible(False)
+        self.banner.setStyleSheet("background:#1f3d2a; color:#e6e6e6;")
         self.banner.setVisible(True)
 
     # ------------------------------------------------------------------ zapis
@@ -1243,7 +1314,7 @@ class MainWindow(QMainWindow):
             rows.append("Pojedyncze zdjęcie<br>")
         if p.rel is not None:
             pct = int(round(p.rel * 100))
-            t_abs = 0.50 - 0.25 * self.sens.value() / 100
+            t_abs = 0.50 - 0.25 * self.applied_sens / 100
             col = "#5cb85c" if 1 - p.rel <= t_abs * 0.75 else ("#e8c547" if 1 - p.rel <= t_abs else "#d9534f")
             bar = min(100, pct)
             rows.append(f"<br>Ostrość: <b style='color:{col}'>{pct}%</b>"
