@@ -134,6 +134,9 @@ def main():
         "C_max_bank": lambda t: np.maximum(np.where(hasC, C @ t - (C @ T.T).mean(1), -9), F @ t - (F @ T.T).mean(1)),
         "D_softmax": lambda t: np.where(hasC, _soft(C, t, T), _soft(F, t, T)),
         "E_f_bank": lambda t: F @ t - (F @ T.T).mean(1),
+        "G_labels30": lambda t: _lab(np.where(hasC[:, None], C, F), t, T, 30),
+        "G_labels60": lambda t: _lab(np.where(hasC[:, None], C, F), t, T, 60),
+        "H_mix": lambda t: _z(_lab(np.where(hasC[:, None], C, F), t, T, 60)) + 0.5 * _z(np.where(hasC, C @ t, F @ t)),
     }
     summary = []
     for vn, fn in variants.items():
@@ -144,13 +147,27 @@ def main():
             p10s.append(float(np.mean(tags_all[top] == want)))
         summary.append(f"{vn}={np.mean(p10s):.0%}")
     print("::warning::Szukaj top10 średnio: " + ", ".join(summary))
-    fn = variants["B_c_bank"]
+    fn = variants["H_mix"]
     for q, want in queries.items():
         sc = fn(TE[q])
         top = np.argsort(-sc)[:10]
         sel = ai.search_select(sc.astype(np.float32), 1.9)
-        print(f"::warning::B „{q}”: top10 {np.mean(tags_all[top] == want):.0%}; wybrane {int(sel.sum())}, trafne "
+        print(f"::warning::H „{q}”: top10 {np.mean(tags_all[top] == want):.0%}; wybrane {int(sel.sum())}, trafne "
               f"{(np.mean(tags_all[sel] == want) if sel.any() else 0):.0%}, znalezione {np.sum(tags_all[sel] == want)}/{np.sum(tags_all == want)}")
+
+
+def _lab(E, t, T, tau):
+    w = np.exp(tau * (T @ t - (T @ t).max()))
+    w /= w.sum()
+    L = 100.0 * (E @ T.T)
+    L -= L.max(1, keepdims=True)
+    P = np.exp(L)
+    P /= P.sum(1, keepdims=True)
+    return P @ w
+
+
+def _z(x):
+    return (x - np.median(x)) / (np.std(x) + 1e-9)
 
 
 def _soft(E, t, T):
