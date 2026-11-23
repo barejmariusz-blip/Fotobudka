@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 import numpy as np
 from PIL import Image
 
-ANALYSIS_EDGE = 1200   # dłuższy bok obrazu do analizy
+ANALYSIS_EDGE = 2000   # dłuższy bok obrazu do analizy
 THUMB_EDGE = 240
 
 _ORIENT_OPS = {
@@ -38,26 +38,50 @@ def open_jpeg(data: bytes, max_edge: int | None, orientation: int) -> Image.Imag
     return apply_orientation(im, orientation)
 
 
-def sharpness_score(img: Image.Image) -> float:
-    """Ostrość najostrzejszego obszaru (tło z bokeh nie zaniża wyniku).
+METRIC_VERSION = 2
 
-    Wariancja Laplasjanu liczona w kafelkach siatki 8x8, wynik = średnia z 3
-    najlepszych kafelków. Lekkie wygładzenie ogranicza wpływ szumu (wysokie ISO).
+
+def _box1d(a: np.ndarray, k: int, axis: int) -> np.ndarray:
+    pad = [(0, 0), (0, 0)]
+    pad[axis] = (k // 2, k // 2)
+    c = np.cumsum(np.pad(a, pad, mode="edge"), axis=axis, dtype=np.float64)
+    zero = np.zeros_like(np.take(c, [0], axis=axis))
+    c = np.concatenate([zero, c], axis=axis)
+    n = a.shape[axis]
+    return ((np.take(c, range(k, k + n), axis=axis) - np.take(c, range(0, n), axis=axis)) / k).astype(np.float32)
+
+
+def sharpness_score(img: Image.Image, grid: int = 12, k: int = 9) -> float:
+    """Ostrość 0..1 najostrzejszego miejsca kadru (np. oczu), niezależna od kontrastu i tła.
+
+    Metoda „ponownego rozmycia” (Crete i in.): obraz rozmywa się filtrem 9 px i mierzy,
+    ile szczegółu ubyło. Ostre krawędzie tracą dużo, nieostre prawie nic. Wynik jest
+    stosunkiem, więc nie zależy od tego, czy zwierzę ma kontrastową sierść, czy jasną.
+    Liczone w kafelkach siatki 12x12, tylko w 15% kafelków z największą ilością detalu
+    (płaskie tło i bokeh są pomijane), osobno w poziomie i pionie (wykrywa poruszenie);
+    wynik = gorsza z osi, średnia z 2 najlepszych kafelków.
     """
     g = np.asarray(img.convert("L"), dtype=np.float32)
-    # wygładzenie 3x3 (box) przeciw szumowi
-    p = np.pad(g, 1, mode="edge")
-    g = (p[:-2, :-2] + p[:-2, 1:-1] + p[:-2, 2:] + p[1:-1, :-2] + p[1:-1, 1:-1] +
-         p[1:-1, 2:] + p[2:, :-2] + p[2:, 1:-1] + p[2:, 2:]) / 9.0
-    lap = 4 * g[1:-1, 1:-1] - g[:-2, 1:-1] - g[2:, 1:-1] - g[1:-1, :-2] - g[1:-1, 2:]
-    h, w = lap.shape
-    n = 8
-    th, tw = h // n, w // n
+    h, w = g.shape[0] - 1, g.shape[1] - 1
+    th, tw = h // grid, w // grid
     if th < 8 or tw < 8:
-        return float(lap.var())
-    tiles = lap[:th * n, :tw * n].reshape(n, th, n, tw).swapaxes(1, 2).reshape(n * n, th * tw)
-    v = np.sort(tiles.var(axis=1))[::-1]
-    return float(v[:3].mean())
+        return 0.0
+
+    def tiles(a):
+        return a[:th * grid, :tw * grid].reshape(grid, th, grid, tw).sum(axis=(1, 3))
+
+    per_axis = []
+    for ax in (0, 1):
+        dF = np.abs(np.diff(g, axis=ax))[:h, :w]
+        dB = np.abs(np.diff(_box1d(g, k, ax), axis=ax))[:h, :w]
+        per_axis.append((tiles(dF), tiles(np.maximum(0, dF - dB))))
+    activity = (per_axis[0][0] + per_axis[1][0]).ravel()
+    top = np.argsort(activity)[::-1][:max(3, int(activity.size * 0.15))]
+    res = []
+    for F, V in per_axis:
+        s = V.ravel()[top] / np.maximum(F.ravel()[top], 1e-6)
+        res.append(float(np.sort(s)[::-1][:2].mean()))
+    return min(res)
 
 
 @dataclass
@@ -80,35 +104,34 @@ def build_groups(times: list[float], gap: float) -> list[Group]:
 
 
 def suggest(scores: list[float | None], groups: list[Group], sensitivity: float) -> tuple[set[int], dict[int, float], dict[int, str]]:
-    """Zwraca (sugerowane do odrzutu, ostrość względna 0..1+, powód: 'blur' | 'series').
+    """Zwraca (sugerowane do odrzutu, ostrość 0..1, powód: 'blur' | 'series').
 
+    Pracujemy na „rozmyciu” b = 1 - ostrość (ostre zdjęcie ~0.1-0.2, nieostre > 0.4).
     sensitivity 0..1: wyżej = więcej odrzutów.
-    Względna ostrość = wynik / 90. percentyl sesji (odporne na pojedyncze wyjątki).
-    Odrzut gdy:
-      * względna ostrość sesji < próg_sesji  (wyraźnie nieostre), lub
-      * w serii (>1 zdjęcie) wynik < próg_serii * najlepszy w serii.
+      * nieostre: b > próg_bezwzględny (0.50 .. 0.25, domyślnie ~0.37),
+      * słabsze w serii: b > F * b_najlepszego i różnica > 0.05 (F 2.6 .. 1.3).
+    Brak porównywania z resztą sesji - zdjęcie z małą głębią ostrości i ostrymi oczami
+    nie przegrywa ze zdjęciami ostrymi w całym kadrze.
     """
-    valid = [s for s in scores if s is not None and s > 0]
     rel: dict[int, float] = {}
     rejects: set[int] = set()
     reasons: dict[int, str] = {}
-    if not valid:
-        return rejects, rel, reasons
-    ref = float(np.percentile(valid, 90)) or 1.0
-    t_session = 0.10 + 0.35 * sensitivity    # 0.10 .. 0.45
-    t_group = 0.30 + 0.45 * sensitivity      # 0.30 .. 0.75
+    t_abs = 0.50 - 0.25 * sensitivity
+    f_series = 2.6 - 1.3 * sensitivity
     for g in groups:
         sc = [(i, scores[i]) for i in g.members if scores[i] is not None]
         if not sc:
             continue
         bi, bs = max(sc, key=lambda x: x[1])
         g.best = bi if len(g.members) > 1 else None
+        b_best = 1 - bs
         for i, s in sc:
-            rel[i] = s / ref
-            if s / ref < t_session:
+            rel[i] = s
+            b = 1 - s
+            if b > t_abs:
                 rejects.add(i)
                 reasons[i] = "blur"
-            elif len(sc) > 1 and bs > 0 and s < t_group * bs:
+            elif len(sc) > 1 and b > f_series * b_best and b - b_best > 0.05:
                 rejects.add(i)
                 reasons[i] = "series"
     return rejects, rel, reasons

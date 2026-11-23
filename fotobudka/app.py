@@ -682,7 +682,7 @@ class MainWindow(QMainWindow):
             p.label = s.get("l")
             if s.get("sz") == st.st_size and abs(s.get("mt", 0) - st.st_mtime) < 2 and "t" in s:
                 p.meta = raw.PhotoMeta(s["t"], s.get("o", 1), s.get("po", 0), s.get("pl", 0))
-                p.score = s.get("s")
+                p.score = s.get("s") if s.get("sv") == analysis.METRIC_VERSION else None
             self.photos.append(p)
             if p.meta is None:
                 need_meta.append(len(self.photos) - 1)
@@ -1087,7 +1087,8 @@ class MainWindow(QMainWindow):
             if p.meta and not p.failed:
                 d.update(t=p.meta.capture_time, o=p.meta.orientation, po=p.meta.preview_offset, pl=p.meta.preview_length)
             if p.score is not None:
-                d["s"] = round(p.score, 3)
+                d["s"] = round(p.score, 4)
+                d["sv"] = analysis.METRIC_VERSION
             if p.rating:
                 d["r"] = p.rating
             if p.rejected:
@@ -1241,14 +1242,15 @@ class MainWindow(QMainWindow):
         else:
             rows.append("Pojedyncze zdjęcie<br>")
         if p.rel is not None:
-            pct = min(150, int(p.rel * 100))
-            col = "#5cb85c" if p.rel >= 0.6 else ("#e8c547" if p.rel >= 0.35 else "#d9534f")
+            pct = int(round(p.rel * 100))
+            t_abs = 0.50 - 0.25 * self.sens.value() / 100
+            col = "#5cb85c" if 1 - p.rel <= t_abs * 0.75 else ("#e8c547" if 1 - p.rel <= t_abs else "#d9534f")
             bar = min(100, pct)
             rows.append(f"<br>Ostrość: <b style='color:{col}'>{pct}%</b>"
                         f"<table width='100%' cellspacing=0 cellpadding=0><tr>"
                         f"<td width='{bar}%' style='background:{col}' height=6></td>"
                         f"<td style='background:#333'></td></tr></table>"
-                        f"<span style='color:#777;font-size:11px'>względem najostrzejszych w sesji</span><br>")
+                        f"<span style='color:#777;font-size:11px'>najostrzejsze miejsce kadru (np. oczy) – tło i bokeh nie mają wpływu</span><br>")
         elif p.failed:
             rows.append("<br><span style='color:#d9534f'>Nie udało się odczytać podglądu</span><br>")
         else:
