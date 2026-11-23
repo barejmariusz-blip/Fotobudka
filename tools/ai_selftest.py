@@ -52,30 +52,22 @@ def main():
             w, h = im.size
             items.append((tag, f + " [crop]", ImageOps.mirror(im.crop((int(w * .08), int(h * .05), int(w * .95), int(h * .97))))))
     print(len(items), "zdjęć")
-    embs = []
+    datas = []
     for tag, f, im in items:
-        buf = io.BytesIO(); im.save(buf, "JPEG", quality=90)
-        embs.append(ai.embed_photo(buf.getvalue(), 1))
-    E = np.stack(embs)
-    S = E @ E.T
-    tags = np.array([t for t, _, _ in items])
-    same = S[(tags[:, None] == tags[None]) & ~np.eye(len(tags), dtype=bool)]
-    diff = S[tags[:, None] != tags[None]]
-    print(f"::notice::Podobieństwo: ta sama rasa śr {same.mean():.3f} (min {same.min():.3f}), różne rasy śr {diff.mean():.3f} (max {diff.max():.3f})")
-    for thr in (0.80, 0.83, 0.86, 0.89):
-        lab = ai.cluster(embs, thr)
-        groups = {}
-        for (t, _, _), l in zip(items, lab):
-            groups.setdefault(l, []).append(t)
-        desc = "; ".join(f"G{l}: " + ",".join(f"{t}x{v.count(t)}" for t in sorted(set(v))) for l, v in sorted(groups.items()))
-        print(f"::notice::próg {thr}: {len(groups)} grup -> {desc}")
-    for tag in SETS:
-        c = ai.centroid([e for e, (t, _, _) in zip(embs, items) if t == tag])
-        print(f"::notice::{tag}: rozpoznano '{ai.name_for(c)[0]}' ({ai.name_for(c)[1]:.2f})")
-
-
-try:
-    main()
-except Exception:
-    print("::error::SELFTEST " + traceback.format_exc().replace("\n", "%0A"))
-    raise
+        buf = io.BytesIO(); im.save(buf, "JPEG", quality=90); datas.append(buf.getvalue())
+    names, T = ai.labels()
+    for mode in ("crop", "full", "mix"):
+        E = np.stack([ai.embed_photo(d, 1, mode) for d in datas])
+        top = [names[int(np.argmax(T @ e))] for e in E]
+        exp = {"Dalmatian": "dalmatyńczyk", "Husky": "husky syberyjski", "BritishSH": "kot brytyjski",
+               "Pug": "mops", "Golden": "golden retriever"}
+        ok = sum(1 for (t, _, _), n in zip(items, top) if exp[t] == n)
+        tags = np.array([t for t, _, _ in items])
+        S = E @ E.T
+        pair = [float(S[i, i + 1]) for i in range(0, len(items) - 1, 2)]
+        same = S[(tags[:, None] == tags[None]) & ~np.eye(len(tags), dtype=bool)]
+        diff = S[tags[:, None] != tags[None]]
+        print(f"::notice::{mode}: rasa trafiona {ok}/{len(items)}; para kadrów śr {np.mean(pair):.3f} min {np.min(pair):.3f}; "
+              f"ta sama rasa śr {same.mean():.3f}; różne rasy śr {diff.mean():.3f} p95 {np.percentile(diff, 95):.3f}")
+        wrong = [f"{t}->{n}" for (t, _, _), n in zip(items, top) if exp[t] != n]
+        print(f"::notice::{mode} błędy: " + ", ".join(wrong[:20]))

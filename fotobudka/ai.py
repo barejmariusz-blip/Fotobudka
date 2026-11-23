@@ -152,10 +152,17 @@ def embed_image(img: Image.Image) -> np.ndarray:
     return v / max(float(np.linalg.norm(v)), 1e-9)
 
 
-def embed_photo(data: bytes, orientation: int) -> np.ndarray:
+def embed_photo(data: bytes, orientation: int, mode: str = "mix") -> np.ndarray:
+    """mode: crop (obiekt w ostrości), full (cały kadr wyśrodkowany), mix (średnia obu)."""
     im = analysis.open_jpeg(data, 1024, orientation)
+    if mode == "full":
+        return embed_image(subject_crop(im, None))
     _, tiles = analysis.sharpness_score(im, return_tiles=True)
-    return embed_image(subject_crop(im, tiles))
+    c = embed_image(subject_crop(im, tiles))
+    if mode == "crop":
+        return c
+    v = c + embed_image(subject_crop(im, None))
+    return v / max(float(np.linalg.norm(v)), 1e-9)
 
 
 def to_b64(v: np.ndarray) -> str:
